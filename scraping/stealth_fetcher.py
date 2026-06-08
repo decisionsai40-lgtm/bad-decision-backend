@@ -78,11 +78,15 @@ def extract_with_adaptive_css(page, selector: str) -> list:
         return []
 
 
-def extract_text_from_html(html: str, max_chars: int = 15000) -> str:
+def extract_text_from_html(html: str, max_chars: int = 15000, min_useful_length: int = 50) -> str:
     """
     Strip HTML tags and return clean text, truncated to max_chars.
     This is passed to DeepSeek for structuring — we don't want to
     send raw HTML because it wastes tokens.
+
+    If the extracted text is very short (under min_useful_length),
+    it likely means the page is JS-rendered and the content isn't
+    in the raw HTML. Returns empty string in that case.
     """
     if not html:
         return ""
@@ -90,6 +94,7 @@ def extract_text_from_html(html: str, max_chars: int = 15000) -> str:
     # Remove script and style blocks entirely
     text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<noscript[^>]*>.*?</noscript>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
     # Remove HTML tags
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -101,6 +106,11 @@ def extract_text_from_html(html: str, max_chars: int = 15000) -> str:
     text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     text = text.replace('&quot;', '"').replace('&#39;', "'")
     text = text.replace('&nbsp;', ' ')
+
+    # If the extracted text is very short, the page is likely JS-rendered
+    # and we won't get useful data from it
+    if len(text) < min_useful_length:
+        return ""
 
     return text[:max_chars]
 
@@ -177,3 +187,15 @@ def build_opencorporates_url(query: str) -> str:
     """Build an OpenCorporates search URL."""
     q = quote_plus(query)
     return f"https://opencorporates.com/companies?q={q}"
+
+
+def build_bing_search_url(query: str, num_results: int = 25) -> str:
+    """Build a Bing search URL — often returns more text content than Google."""
+    q = quote_plus(f"{query} business")
+    return f"https://www.bing.com/search?q={q}&count={num_results}"
+
+
+def build_duckduckgo_search_url(query: str) -> str:
+    """Build a DuckDuckGo HTML search URL — lightweight, less JS-heavy."""
+    q = quote_plus(f"{query} business")
+    return f"https://html.duckduckgo.com/html/?q={q}"
