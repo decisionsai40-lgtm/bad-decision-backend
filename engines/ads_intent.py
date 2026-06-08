@@ -1,6 +1,6 @@
 """
-BAD DECISION AI — Engine 1: Digital Ads Intelligence (Scrapling-First)
-======================================================================
+BAD DECISION AI — Engine 1: Digital Ads Intelligence (Scrapling-First + DeepSeek Fallback)
+=========================================================================================
 This engine scrapes Meta Ads Library and Google search to find
 businesses that are actively running ads.
 
@@ -9,6 +9,10 @@ PIPELINE (as specified in TRD Section 4):
 2. DeepSeek structures the scraped HTML/text into clean lead objects
 3. Validation gates run (DNS → Footprint → SMTP based on tier)
 4. Dedup & cache
+
+FALLBACK: If all Scrapling sources fail (JS-heavy pages), we use
+DeepSeek's knowledge to find businesses matching the query. This is
+less reliable than scraping but ensures the user always gets results.
 
 Why? If a business is spending money on ads, they have a marketing budget.
 That makes them a hot lead for agencies and service providers.
@@ -22,6 +26,8 @@ from scraping.stealth_fetcher import (
     extract_text_from_html,
     build_meta_ads_library_url,
     build_google_search_url,
+    build_bing_search_url,
+    build_duckduckgo_search_url,
 )
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
@@ -38,7 +44,7 @@ async def run_ads_intent(
     Search for companies running ads based on the user's query.
 
     PIPELINE:
-    1. Scrapling fetches pages from Meta Ads Library + Google search
+    1. Scrapling fetches pages from Meta Ads Library + search engines
     2. DeepSeek structures the raw scraped text into lead objects
     3. DeepSeek enriches each lead with DM contact details
     4. Validation gates run (DNS → Footprint → SMTP)
@@ -88,57 +94,116 @@ async def run_ads_intent(
     else:
         print(f"[ADS_INTENT] Google Search fetch failed")
 
-    if not scraped_texts:
-        print(f"[ADS_INTENT] All Scrapling sources failed — no data to process")
-        return []
+    # Source 3: Bing search (often returns more text content)
+    bing_url = build_bing_search_url(f"{query} running ads advertising")
+    bing_result = await stealth_fetch(bing_url)
+    if bing_result:
+        text = extract_text_from_html(bing_result["html"])
+        if text:
+            scraped_texts.append({
+                "source": "Bing Search",
+                "content": text,
+            })
+            print(f"[ADS_INTENT] Scraped Bing Search: {len(text)} chars")
+    else:
+        print(f"[ADS_INTENT] Bing Search fetch failed")
 
-    # Combine all scraped content for DeepSeek
-    combined_text = "\n\n".join(
-        f"--- SOURCE: {s['source']} ---\n{s['content']}"
-        for s in scraped_texts
-    )
+    # Source 4: DuckDuckGo HTML (lightweight, less JS-heavy)
+    ddg_url = build_duckduckgo_search_url(f"{query} running ads advertising business")
+    ddg_result = await stealth_fetch(ddg_url)
+    if ddg_result:
+        text = extract_text_from_html(ddg_result["html"])
+        if text:
+            scraped_texts.append({
+                "source": "DuckDuckGo",
+                "content": text,
+            })
+            print(f"[ADS_INTENT] Scraped DuckDuckGo: {len(text)} chars")
+    else:
+        print(f"[ADS_INTENT] DuckDuckGo fetch failed")
+
+    # Combine all scraped content
+    combined_text = ""
+    if scraped_texts:
+        combined_text = "\n\n".join(
+            f"--- SOURCE: {s['source']} ---\n{s['content']}"
+            for s in scraped_texts
+        )
+        print(f"[ADS_INTENT] Combined scraped text: {len(combined_text)} chars from {len(scraped_texts)} sources")
+    else:
+        print(f"[ADS_INTENT] All Scrapling sources returned empty text — using DeepSeek knowledge fallback")
 
     # --------------------------------------------------------
-    # PHASE 2: DEEPSEEK — Structure the scraped data
+    # PHASE 2: DEEPSEEK — Structure the data
     # --------------------------------------------------------
-    print(f"[ADS_INTENT] DeepSeek Phase: Structuring scraped data")
+    print(f"[ADS_INTENT] DeepSeek Phase: Structuring data")
 
-    structure_prompt = f"""
-    You are a business data extractor. Below is REAL TEXT scraped from the internet
-    about businesses related to: "{query}"
+    if combined_text:
+        # We have scraped text — ask DeepSeek to extract from it
+        structure_prompt = f"""
+        You are a business data extractor. Below is REAL TEXT scraped from the internet
+        about businesses related to: "{query}"
 
-    Your job is to extract REAL businesses mentioned in this text.
-    Do NOT invent or hallucinate businesses that are not in the text.
-    Only extract companies that are clearly named in the scraped content.
+        Your job is to extract REAL businesses mentioned in this text.
+        Do NOT invent or hallucinate businesses that are not in the text.
+        Only extract companies that are clearly named in the scraped content.
 
-    SCRAPED CONTENT:
-    {combined_text[:12000]}
+        SCRAPED CONTENT:
+        {combined_text[:12000]}
 
-    For each REAL business you find, provide:
-    - company_name: The exact business name as mentioned
-    - website_url: Their website domain if mentioned (or "ABSENT" if not found)
-    - ad_platform: Which platform they advertise on if mentioned (or "ABSENT")
+        For each REAL business you find, provide:
+        - company_name: The exact business name as mentioned
+        - website_url: Their website domain if mentioned (or "ABSENT" if not found)
+        - ad_platform: Which platform they advertise on if mentioned (or "ABSENT")
 
-    Return a JSON object with a "businesses" array. Find up to 25 businesses.
-    If you cannot find data for a field, write "ABSENT".
+        Return a JSON object with a "businesses" array. Find up to 25 businesses.
+        If you cannot find data for a field, write "ABSENT".
 
-    Example format:
-    {{
-        "businesses": [
-            {{
-                "company_name": "ABC Roofing",
-                "website_url": "https://abcroofing.com",
-                "ad_platform": "Meta Ads"
-            }}
-        ]
-    }}
-    """
+        Example format:
+        {{
+            "businesses": [
+                {{
+                    "company_name": "ABC Roofing",
+                    "website_url": "https://abcroofing.com",
+                    "ad_platform": "Meta Ads"
+                }}
+            ]
+        }}
+        """
+    else:
+        # Fallback: No scraped text — use DeepSeek's knowledge
+        structure_prompt = f"""
+        You are a business data researcher. Find real businesses related to: "{query}"
+        that are likely running digital ads (Google Ads, Meta Ads, etc.).
+
+        Use your knowledge to identify businesses that would match this search.
+        Focus on businesses that are actively advertising or have a marketing budget.
+
+        For each business you find, provide:
+        - company_name: The real business name
+        - website_url: Their website URL (or "ABSENT" if unknown)
+        - ad_platform: Which platform they likely advertise on (or "ABSENT")
+
+        Return a JSON object with a "businesses" array. Find up to 15 businesses.
+        If you cannot find data for a field, write "ABSENT".
+
+        Example format:
+        {{
+            "businesses": [
+                {{
+                    "company_name": "ABC Roofing",
+                    "website_url": "https://abcroofing.com",
+                    "ad_platform": "Google Ads"
+                }}
+            ]
+        }}
+        """
 
     try:
         response = await execute_llm_payload({
             "model": DEEPSEEK_SCOUT_MODEL,
             "messages": [
-                {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses mentioned in the provided text. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
+                {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
                 {"role": "user", "content": structure_prompt},
             ],
             "response_format": {"type": "json_object"},
@@ -159,10 +224,10 @@ async def run_ads_intent(
         print(f"[ADS_INTENT] DeepSeek structuring error: {e}")
         businesses = []
 
-    print(f"[ADS_INTENT] DeepSeek extracted {len(businesses)} candidate businesses from scraped data")
+    print(f"[ADS_INTENT] DeepSeek extracted {len(businesses)} candidate businesses")
 
     # --------------------------------------------------------
-    # PHASE 3: VALIDATE & ENRCH each business
+    # PHASE 3: VALIDATE & ENRICH each business
     # --------------------------------------------------------
     for biz in businesses[:25]:
         company_name = biz.get("company_name", "ABSENT")
@@ -194,7 +259,6 @@ async def run_ads_intent(
 
         # --------------------------------------------------------
         # DeepSeek Enrichment — find decision maker details
-        # (also visits the company website via Scrapling if possible)
         # --------------------------------------------------------
         enrichment = await _enrich_lead(company_name, website_url, user_tier)
 
