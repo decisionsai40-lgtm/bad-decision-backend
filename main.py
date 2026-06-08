@@ -32,7 +32,7 @@ from config import PORT, DEBUG, COIN_FREE_TRIAL
 app = FastAPI(
     title="Bad Decision AI — Backend Engine",
     description="The scraping and validation engine that powers Bad Decision AI",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # ============================================================
@@ -95,7 +95,7 @@ def root():
     return {
         "status": "alive",
         "service": "Bad Decision AI Backend",
-        "version": "1.2.0",
+        "version": "1.3.0",
     }
 
 
@@ -201,18 +201,79 @@ async def get_user_tasks(user_id: str):
     return {"tasks": result.data}
 
 
-@app.get("/api/leads/{collection_id}")
-async def get_collection_leads(collection_id: str):
-    """Get all leads in a specific Smart Collection."""
+# ============================================================
+# LEADS ENDPOINT — Fixed to support both task_id and collection_id
+# ============================================================
+@app.get("/api/leads/{lookup_id}")
+async def get_collection_leads(lookup_id: str):
+    """
+    Get all leads for a search result.
+    The frontend may pass either a collection_id OR a task_id.
+    We try collection_id first (proper way), then fall back to task_id.
+    """
     from supabase_client import get_supabase
     db = get_supabase()
+
+    # Try 1: Look up by collection_id (the proper way)
     result = (
         db.table("workspace_leads")
         .select("*, global_intelligence_cache(*)")
-        .eq("collection_id", collection_id)
+        .eq("collection_id", lookup_id)
         .execute()
     )
-    return {"leads": result.data}
+
+    if result.data and len(result.data) > 0:
+        return {"leads": result.data}
+
+    # Try 2: Look up by task_id (frontend compatibility — it passes task IDs)
+    result = (
+        db.table("workspace_leads")
+        .select("*, global_intelligence_cache(*)")
+        .eq("task_id", lookup_id)
+        .execute()
+    )
+
+    return {"leads": result.data or []}
+
+
+# ============================================================
+# COLLECTIONS ENDPOINT — New endpoint for proper collection listing
+# ============================================================
+@app.get("/api/collections/{user_id}")
+async def get_user_collections(user_id: str):
+    """
+    Get all smart collections for a user, with lead counts.
+    This is the proper way for the frontend to list past searches.
+    """
+    from supabase_client import get_supabase
+    db = get_supabase()
+
+    result = (
+        db.table("smart_collections")
+        .select("id, user_id, name, task_type, created_at, workspace_leads(count)")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    collections = []
+    for col in (result.data or []):
+        lead_count = 0
+        wl = col.get("workspace_leads")
+        if isinstance(wl, list) and len(wl) > 0:
+            lead_count = wl[0].get("count", 0) if isinstance(wl[0], dict) else len(wl)
+        elif isinstance(wl, dict):
+            lead_count = wl.get("count", 0)
+
+        collections.append({
+            "id": col.get("id"),
+            "name": col.get("name", "Untitled Search"),
+            "task_type": col.get("task_type", ""),
+            "lead_count": lead_count,
+            "created_at": col.get("created_at", ""),
+        })
+
+    return {"collections": collections}
 
 
 @app.get("/api/cache/check")
@@ -262,10 +323,11 @@ async def add_coins(user_id: str, amount: int):
         }).execute()
     except Exception as e:
         print(f"[BACKEND] add_coins RPC error: {e}")
-        # Fallback: manual insert if RPC fails
-        ledger_result = db.table("coin_balances").select("user_id").eq("user_id", user_id).execute()
+        # Fallback: manual increment if RPC fails
+        ledger_result = db.table("coin_balances").select("balance, total_purchased").eq("user_id", user_id).execute()
 
         if not ledger_result.data:
+            # No row exists — create it
             db.table("coin_balances").insert({
                 "user_id": user_id,
                 "balance": amount,
@@ -273,9 +335,12 @@ async def add_coins(user_id: str, amount: int):
                 "total_purchased": amount,
             }).execute()
         else:
+            # Row exists — INCREMENT (not overwrite!)
+            current_balance = ledger_result.data[0].get("balance", 0)
+            current_purchased = ledger_result.data[0].get("total_purchased", 0)
             db.table("coin_balances").update({
-                "balance": amount,  # This is wrong — should be increment, but RPC failed
-                "total_purchased": amount,
+                "balance": current_balance + amount,
+                "total_purchased": current_purchased + amount,
             }).eq("user_id", user_id).execute()
 
     return {"success": True}
