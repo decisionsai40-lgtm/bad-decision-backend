@@ -1,15 +1,18 @@
 """
-BAD DECISION AI — Engine 2: Local Businesses — Brick & Mortar (Scrapling-First)
-================================================================================
-This engine finds local businesses by scraping Google Maps search
-results and Google search, then cross-referencing with OpenCorporates.
+BAD DECISION AI — Engine 2: Local Businesses — Brick & Mortar (Scrapling-First + DeepSeek Fallback)
+==================================================================================================
+This engine finds local businesses by scraping search
+results and cross-referencing with OpenCorporates.
 
 PIPELINE (as specified in TRD Section 4):
-1. Scrapling fetches REAL data from Google Maps + Google search + OpenCorporates
+1. Scrapling fetches REAL data from Google Maps + search + OpenCorporates
 2. DeepSeek structures the scraped HTML/text into clean lead objects
 3. HARD FILTER: Drop any entity with > 50 employees or no physical address
 4. Validation gates run (DNS → Footprint → SMTP based on tier)
 5. Dedup & cache
+
+FALLBACK: If all Scrapling sources fail (JS-heavy pages), we use
+DeepSeek's knowledge to find businesses matching the query.
 
 HARD RULE: Drop any entity with > 50 employees or lacking
 local physical coordinates. We only want small businesses.
@@ -24,6 +27,8 @@ from scraping.stealth_fetcher import (
     build_google_maps_url,
     build_google_search_url,
     build_opencorporates_url,
+    build_bing_search_url,
+    build_duckduckgo_search_url,
 )
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
@@ -40,7 +45,7 @@ async def run_smb_maps(
     Find local brick-and-mortar businesses matching the user's query.
 
     PIPELINE:
-    1. Scrapling fetches Google Maps + Google search + OpenCorporates
+    1. Scrapling fetches Google Maps + search + OpenCorporates
     2. DeepSeek structures scraped text into lead objects
     3. Hard filters: <50 employees, must have physical address
     4. DeepSeek enriches each lead with DM contact details
@@ -98,64 +103,128 @@ async def run_smb_maps(
     else:
         print(f"[SMB_MAPS] OpenCorporates fetch failed")
 
-    if not scraped_texts:
-        print(f"[SMB_MAPS] All Scrapling sources failed — no data to process")
-        return []
+    # Source 4: Bing search (often returns more text content)
+    bing_url = build_bing_search_url(f"{query} local small business")
+    bing_result = await stealth_fetch(bing_url)
+    if bing_result:
+        text = extract_text_from_html(bing_result["html"])
+        if text:
+            scraped_texts.append({
+                "source": "Bing Search",
+                "content": text,
+            })
+            print(f"[SMB_MAPS] Scraped Bing Search: {len(text)} chars")
+    else:
+        print(f"[SMB_MAPS] Bing Search fetch failed")
 
-    # Combine all scraped content for DeepSeek
-    combined_text = "\n\n".join(
-        f"--- SOURCE: {s['source']} ---\n{s['content']}"
-        for s in scraped_texts
-    )
+    # Source 5: DuckDuckGo HTML (lightweight, less JS-heavy)
+    ddg_url = build_duckduckgo_search_url(f"{query} local small business near me")
+    ddg_result = await stealth_fetch(ddg_url)
+    if ddg_result:
+        text = extract_text_from_html(ddg_result["html"])
+        if text:
+            scraped_texts.append({
+                "source": "DuckDuckGo",
+                "content": text,
+            })
+            print(f"[SMB_MAPS] Scraped DuckDuckGo: {len(text)} chars")
+    else:
+        print(f"[SMB_MAPS] DuckDuckGo fetch failed")
+
+    # Combine all scraped content
+    combined_text = ""
+    if scraped_texts:
+        combined_text = "\n\n".join(
+            f"--- SOURCE: {s['source']} ---\n{s['content']}"
+            for s in scraped_texts
+        )
+        print(f"[SMB_MAPS] Combined scraped text: {len(combined_text)} chars from {len(scraped_texts)} sources")
+    else:
+        print(f"[SMB_MAPS] All Scrapling sources returned empty text — using DeepSeek knowledge fallback")
 
     # --------------------------------------------------------
-    # PHASE 2: DEEPSEEK — Structure the scraped data
+    # PHASE 2: DEEPSEEK — Structure the data
     # --------------------------------------------------------
-    print(f"[SMB_MAPS] DeepSeek Phase: Structuring scraped data")
+    print(f"[SMB_MAPS] DeepSeek Phase: Structuring data")
 
-    structure_prompt = f"""
-    You are a local business data extractor. Below is REAL TEXT scraped from the internet
-    about local businesses related to: "{query}"
+    if combined_text:
+        structure_prompt = f"""
+        You are a local business data extractor. Below is REAL TEXT scraped from the internet
+        about local businesses related to: "{query}"
 
-    Your job is to extract REAL businesses mentioned in this text.
-    Do NOT invent or hallucinate businesses that are not in the text.
-    Only extract businesses that are clearly named in the scraped content.
+        Your job is to extract REAL businesses mentioned in this text.
+        Do NOT invent or hallucinate businesses that are not in the text.
+        Only extract businesses that are clearly named in the scraped content.
 
-    HARD RULES:
-    - Each business MUST have fewer than 50 employees (if mentioned)
-    - Each business MUST have a physical street address (no online-only businesses)
-    - NO chains or large corporations
+        HARD RULES:
+        - Each business MUST have fewer than 50 employees (if mentioned)
+        - Each business MUST have a physical street address (no online-only businesses)
+        - NO chains or large corporations
 
-    SCRAPED CONTENT:
-    {combined_text[:12000]}
+        SCRAPED CONTENT:
+        {combined_text[:12000]}
 
-    For each REAL business you find, provide:
-    - company_name: The exact business name as mentioned
-    - website_url: Their website (or "ABSENT" if not found)
-    - address: Their physical street address if mentioned (or "ABSENT")
-    - employee_count: Approximate number of employees if mentioned (or "ABSENT")
+        For each REAL business you find, provide:
+        - company_name: The exact business name as mentioned
+        - website_url: Their website (or "ABSENT" if not found)
+        - address: Their physical street address if mentioned (or "ABSENT")
+        - employee_count: Approximate number of employees if mentioned (or "ABSENT")
 
-    Return a JSON object with a "businesses" array. Find up to 25 businesses.
-    If you cannot find data for a field, write "ABSENT".
+        Return a JSON object with a "businesses" array. Find up to 25 businesses.
+        If you cannot find data for a field, write "ABSENT".
 
-    Example format:
-    {{
-        "businesses": [
-            {{
-                "company_name": "Mike's Roofing LLC",
-                "website_url": "https://mikesroofing.com",
-                "address": "123 Main St, Dallas, TX",
-                "employee_count": "8"
-            }}
-        ]
-    }}
-    """
+        Example format:
+        {{
+            "businesses": [
+                {{
+                    "company_name": "Mike's Roofing LLC",
+                    "website_url": "https://mikesroofing.com",
+                    "address": "123 Main St, Dallas, TX",
+                    "employee_count": "8"
+                }}
+            ]
+        }}
+        """
+    else:
+        # Fallback: No scraped text — use DeepSeek's knowledge
+        structure_prompt = f"""
+        You are a local business data researcher. Find real small businesses related to: "{query}"
+
+        Use your knowledge to identify local small businesses that match this search.
+        Focus on businesses with fewer than 50 employees that have a physical location.
+
+        HARD RULES:
+        - Each business MUST have fewer than 50 employees
+        - Each business MUST have a physical street address (no online-only businesses)
+        - NO chains or large corporations
+
+        For each business you find, provide:
+        - company_name: The real business name
+        - website_url: Their website (or "ABSENT" if unknown)
+        - address: Their physical street address (or "ABSENT" if unknown)
+        - employee_count: Approximate number of employees (or "ABSENT" if unknown)
+
+        Return a JSON object with a "businesses" array. Find up to 15 businesses.
+        If you cannot find data for a field, write "ABSENT".
+
+        Example format:
+        {{
+            "businesses": [
+                {{
+                    "company_name": "Mike's Roofing LLC",
+                    "website_url": "https://mikesroofing.com",
+                    "address": "123 Main St, Dallas, TX",
+                    "employee_count": "8"
+                }}
+            ]
+        }}
+        """
 
     try:
         response = await execute_llm_payload({
             "model": DEEPSEEK_SCOUT_MODEL,
             "messages": [
-                {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses mentioned in the provided text. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
+                {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
                 {"role": "user", "content": structure_prompt},
             ],
             "response_format": {"type": "json_object"},
@@ -176,7 +245,7 @@ async def run_smb_maps(
         print(f"[SMB_MAPS] DeepSeek structuring error: {e}")
         businesses = []
 
-    print(f"[SMB_MAPS] DeepSeek extracted {len(businesses)} candidate businesses from scraped data")
+    print(f"[SMB_MAPS] DeepSeek extracted {len(businesses)} candidate businesses")
 
     # --------------------------------------------------------
     # PHASE 3: FILTER, VALIDATE & ENRICH each business
@@ -199,10 +268,8 @@ async def run_smb_maps(
         except (ValueError, TypeError):
             pass  # If we can't parse employee count, let it through
 
-        # HARD FILTER: Must have physical address (coordinates)
-        if address == "ABSENT" or not address:
-            print(f"[SMB_MAPS] {company_name} has no physical address — DROPPED")
-            continue
+        # SOFT FILTER: Prefer businesses with physical address, but don't drop if missing
+        # (DeepSeek fallback may not have addresses)
 
         # Dedup check
         url_to_hash = website_url if website_url != "ABSENT" else company_name
