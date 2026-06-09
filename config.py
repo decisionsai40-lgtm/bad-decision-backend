@@ -52,7 +52,7 @@ DEEPSEEK_SCHOLAR_MODEL = os.getenv("DEEPSEEK_SCHOLAR_MODEL", "deepseek-reasoner"
 COIN_COST_SCAN = 1       # Live Internet Scan (Gate 1 only)
 COIN_COST_DEEP = 2       # AI Deep Finder (Gate 1 & 2)
 COIN_COST_SMTP = 3       # Guaranteed Human Target (Gate 1, 2 & 3)
-COIN_FREE_TRIAL = 50     # Coins given to new free users
+COIN_FREE_TRIAL = 1000   # Coins given to new free users (raised from 50)
 
 
 # ============================================================
