@@ -63,6 +63,48 @@ async def stealth_fetch(
     return None
 
 
+async def stealth_fetch_contact_page(
+    website_url: str,
+    timeout: int = 15,
+) -> Optional[Dict[str, Any]]:
+    """
+    Try to fetch common contact/about pages from a website.
+    Many sites use simple server-rendered contact pages that
+    Scrapling CAN scrape (unlike JS-heavy homepages).
+
+    Tries these paths in order:
+    1. /contact
+    2. /contact-us
+    3. /about
+    4. /about-us
+    5. /team
+
+    Returns the FIRST page that returns useful text content.
+    """
+    if not website_url or website_url == "ABSENT":
+        return None
+
+    # Normalize the base URL
+    base = website_url.rstrip("/")
+    if not base.startswith("http"):
+        base = f"https://{base}"
+
+    contact_paths = ["/contact", "/contact-us", "/about", "/about-us", "/team"]
+
+    for path in contact_paths:
+        try:
+            result = await stealth_fetch(f"{base}{path}", timeout=timeout)
+            if result:
+                text = extract_text_from_html(result["html"], min_useful_length=30)
+                if text:
+                    print(f"[STEALTH] Contact page found at {base}{path} ({len(text)} chars)")
+                    return result
+        except Exception:
+            continue
+
+    return None
+
+
 def extract_with_adaptive_css(page, selector: str) -> list:
     """
     Use Scrapling's adaptive CSS extraction to find elements
@@ -78,7 +120,7 @@ def extract_with_adaptive_css(page, selector: str) -> list:
         return []
 
 
-def extract_text_from_html(html: str, max_chars: int = 15000, min_useful_length: int = 50) -> str:
+def extract_text_from_html(html: str, max_chars: int = 15000, min_useful_length: int = 20) -> str:
     """
     Strip HTML tags and return clean text, truncated to max_chars.
     This is passed to DeepSeek for structuring — we don't want to
@@ -87,6 +129,9 @@ def extract_text_from_html(html: str, max_chars: int = 15000, min_useful_length:
     If the extracted text is very short (under min_useful_length),
     it likely means the page is JS-rendered and the content isn't
     in the raw HTML. Returns empty string in that case.
+
+    NOTE: Lowered min_useful_length from 50 to 20 — even short
+    snippets like a phone number in a meta tag are valuable.
     """
     if not html:
         return ""
@@ -198,4 +243,13 @@ def build_bing_search_url(query: str, num_results: int = 25) -> str:
 def build_duckduckgo_search_url(query: str) -> str:
     """Build a DuckDuckGo HTML search URL — lightweight, less JS-heavy."""
     q = quote_plus(f"{query} business")
+    return f"https://html.duckduckgo.com/html/?q={q}"
+
+
+def build_contact_search_url(company_name: str) -> str:
+    """
+    Build a DuckDuckGo search URL specifically for finding contact details.
+    This searches for the company's email, phone, and contact page.
+    """
+    q = quote_plus(f'"{company_name}" email phone contact')
     return f"https://html.duckduckgo.com/html/?q={q}"
