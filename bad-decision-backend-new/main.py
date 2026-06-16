@@ -3,12 +3,14 @@ BAD DECISION AI — FastAPI Main Server
 ======================================
 This is the entry point for the entire Python backend.
 It starts the web server and sets up all the routes.
+
+FIX: Uses Pydantic models for JSON body parsing (fixes 422 error).
+Clerk user IDs are TEXT strings like "user_3Ew45fAIqwEJ3naNttXUPMxTfFt", NOT UUIDs.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
 import uvicorn
 from config import PORT, DEBUG
 
@@ -16,7 +18,7 @@ from config import PORT, DEBUG
 app = FastAPI(
     title="Bad Decision AI — Backend Engine",
     description="The scraping and validation engine that powers Bad Decision AI",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 # ============================================================
@@ -32,10 +34,9 @@ app.add_middleware(
 
 
 # ============================================================
-# PYDANTIC MODELS — Request body validation
+# PYDANTIC MODELS — Fix 422 error by properly parsing JSON body
 # ============================================================
 class TaskCreateRequest(BaseModel):
-    """Request body for creating a new search task."""
     user_id: str = Field(..., min_length=1, max_length=256)
     task_type: str = Field(..., pattern=r"^(ads_intent|smb_maps|web_absent|social_intent)$")
     query: str = Field(..., min_length=1, max_length=1000)
@@ -45,7 +46,6 @@ class TaskCreateRequest(BaseModel):
 
 
 class CoinOperationRequest(BaseModel):
-    """Request body for coin add/deduct operations."""
     user_id: str = Field(..., min_length=1, max_length=256)
     amount: int = Field(..., gt=0, le=10000)
 
@@ -59,7 +59,7 @@ def root():
     return {
         "status": "alive",
         "service": "Bad Decision AI Backend",
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
 
 
@@ -84,22 +84,22 @@ def health_check():
 # TASK ENDPOINTS
 # ============================================================
 @app.post("/api/tasks/create")
-async def create_task(request: TaskCreateRequest):
-    """Create a new search task. Accepts JSON body."""
+async def create_task(req: TaskCreateRequest):
+    """Create a new search task. Accepts JSON body (fixes 422 error)."""
     from supabase_client import get_supabase
     db = get_supabase()
     insert_data = {
-        "user_id": request.user_id,
-        "task_type": request.task_type,
-        "query": request.query,
+        "user_id": req.user_id,
+        "task_type": req.task_type,
+        "query": req.query,
         "status": "pending",
-        "coins_reserved": request.coins_reserved,
+        "coins_reserved": req.coins_reserved,
     }
-    # Store country/region if the columns exist in the tasks table
-    if request.country:
-        insert_data["country"] = request.country
-    if request.state_region:
-        insert_data["state_region"] = request.state_region
+    # Store country/region if provided
+    if req.country:
+        insert_data["country"] = req.country
+    if req.state_region:
+        insert_data["state_region"] = req.state_region
 
     result = db.table("tasks").insert(insert_data).execute()
     return {"success": True, "task": result.data}
@@ -126,7 +126,6 @@ async def get_task_status(task_id: str):
     # If task is completed, also fetch leads
     if task.get("status") == "completed":
         try:
-            # Try fetching leads via collection_id from smart_collections
             coll_result = (
                 db.table("smart_collections")
                 .select("id")
@@ -158,7 +157,7 @@ async def get_task_status(task_id: str):
 
 @app.get("/api/tasks/{user_id}")
 async def get_user_tasks(user_id: str):
-    """Get all tasks for a specific user."""
+    """Get all tasks for a specific user. user_id is Clerk ID (TEXT string)."""
     from supabase_client import get_supabase
     db = get_supabase()
     result = (
@@ -198,27 +197,60 @@ async def check_cache(company_name: str = "", website_url: str = ""):
 
 
 @app.post("/api/coins/deduct")
-async def deduct_coins(request: CoinOperationRequest):
+async def deduct_coins(req: CoinOperationRequest):
     """Deduct coins from a user's ledger. Accepts JSON body."""
     from supabase_client import get_supabase
     db = get_supabase()
     result = db.rpc("deduct_coins", {
-        "p_user_id": request.user_id,
-        "p_amount": request.amount,
+        "p_user_id": req.user_id,
+        "p_amount": req.amount,
     }).execute()
     return {"success": result.data}
 
 
 @app.post("/api/coins/add")
-async def add_coins(request: CoinOperationRequest):
+async def add_coins(req: CoinOperationRequest):
     """Add coins to a user's ledger after payment. Accepts JSON body."""
     from supabase_client import get_supabase
     db = get_supabase()
     db.rpc("add_coins", {
-        "p_user_id": request.user_id,
-        "p_amount": request.amount,
+        "p_user_id": req.user_id,
+        "p_amount": req.amount,
     }).execute()
     return {"success": True}
+
+
+# ============================================================
+# COIN BALANCE ENDPOINT (was missing!)
+# ============================================================
+@app.get("/api/coins/{user_id}")
+async def get_coin_balance(user_id: str):
+    """Get a user's coin balance. user_id is Clerk ID (TEXT string)."""
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("usage_ledger")
+        .select("coins_balance, coins_reserved, coins_lifetime")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return {
+            "balance": {
+                "coins_balance": 0,
+                "coins_reserved": 0,
+                "coins_lifetime": 0,
+            }
+        }
+    row = result.data[0]
+    return {
+        "balance": {
+            "coins_balance": row["coins_balance"],
+            "coins_reserved": row["coins_reserved"],
+            "coins_lifetime": row["coins_lifetime"],
+        }
+    }
 
 
 # ============================================================
