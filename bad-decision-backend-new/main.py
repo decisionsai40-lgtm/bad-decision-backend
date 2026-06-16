@@ -1,24 +1,31 @@
 """
 BAD DECISION AI — FastAPI Main Server
 ======================================
-This is the entry point for the entire Python backend.
-It starts the web server and sets up all the routes.
+Entry point for the entire Python backend.
+Starts the web server and sets up all the routes.
 
-FIX: Uses Pydantic models for JSON body parsing (fixes 422 error).
-Clerk user IDs are TEXT strings like "user_3Ew45fAIqwEJ3naNttXUPMxTfFt", NOT UUIDs.
+KEY DESIGN:
+- Clerk user IDs are TEXT strings like "user_3Ew45fAIqwEJ3naNttXUPMxTfFt", NOT UUIDs.
+- Uses Pydantic models for JSON body parsing (fixes 422 errors).
+- Tier-based engine enforcement: free users can only use ads_intent and smb_maps.
+- Coin balance endpoint at /api/coins/{user_id}.
+- Background task worker started on startup.
+- No device fingerprint logic — multiple accounts per device are allowed.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import Optional
 import uvicorn
-from config import PORT, DEBUG
+import os
+from config import PORT, DEBUG, BACKEND_API_SECRET
 
 # Create the FastAPI app
 app = FastAPI(
     title="Bad Decision AI — Backend Engine",
     description="The scraping and validation engine that powers Bad Decision AI",
-    version="1.1.0",
+    version="2.0.0",
 )
 
 # ============================================================
@@ -34,24 +41,50 @@ app.add_middleware(
 
 
 # ============================================================
-# PYDANTIC MODELS — Fix 422 error by properly parsing JSON body
+# TIER CONFIG — which engines each tier can use
+# ============================================================
+TIER_ENGINES = {
+    "free":    ["ads_intent", "smb_maps"],
+    "starter": ["ads_intent", "smb_maps", "web_absent", "social_intent"],
+    "growth":  ["ads_intent", "smb_maps", "web_absent", "social_intent"],
+    "pro":     ["ads_intent", "smb_maps", "web_absent", "social_intent"],
+}
+
+VALID_ENGINES = {"ads_intent", "smb_maps", "web_absent", "social_intent"}
+
+
+# ============================================================
+# PYDANTIC MODELS
 # ============================================================
 class TaskCreateRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=256)
     task_type: str = Field(..., pattern=r"^(ads_intent|smb_maps|web_absent|social_intent)$")
     query: str = Field(..., min_length=1, max_length=1000)
-    coins_reserved: int = Field(default=0, ge=0)
+    coins_reserved: int = Field(default=2, ge=0)
     country: str = Field(default="", max_length=10)
     state_region: str = Field(default="", max_length=100)
 
 
 class CoinOperationRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=256)
-    amount: int = Field(..., gt=0, le=10000)
+    amount: int = Field(..., gt=0, le=100000)
 
 
 # ============================================================
-# HEALTH CHECK — Is the server alive?
+# AUTH HELPER — Verify X-API-Secret header (optional)
+# ============================================================
+def verify_api_secret(x_api_secret: Optional[str] = Header(None)) -> bool:
+    """
+    Verify the X-API-Secret header if BACKEND_API_SECRET is set.
+    If BACKEND_API_SECRET is empty or unset, allow all requests (dev mode).
+    """
+    if not BACKEND_API_SECRET:
+        return True
+    return x_api_secret == BACKEND_API_SECRET
+
+
+# ============================================================
+# HEALTH CHECK
 # ============================================================
 @app.get("/")
 def root():
@@ -59,13 +92,13 @@ def root():
     return {
         "status": "alive",
         "service": "Bad Decision AI Backend",
-        "version": "1.1.0",
+        "version": "2.0.0",
     }
 
 
 @app.get("/health")
 def health_check():
-    """More detailed health check."""
+    """Detailed health check including database connectivity."""
     try:
         from supabase_client import get_supabase
         db = get_supabase()
@@ -77,6 +110,7 @@ def health_check():
     return {
         "status": "healthy",
         "database": db_status,
+        "version": "2.0.0",
     }
 
 
@@ -84,10 +118,62 @@ def health_check():
 # TASK ENDPOINTS
 # ============================================================
 @app.post("/api/tasks/create")
-async def create_task(req: TaskCreateRequest):
-    """Create a new search task. Accepts JSON body (fixes 422 error)."""
+async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Header(None)):
+    """
+    Create a new search task.
+    Tier-based engine enforcement: free users can only use ads_intent and smb_maps.
+    """
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
     from supabase_client import get_supabase
     db = get_supabase()
+
+    # === TIER-BASED ENGINE ENFORCEMENT ===
+    # Fetch user's tier from profiles table
+    user_tier = "free"  # default
+    try:
+        profile_result = (
+            db.table("profiles")
+            .select("tier")
+            .eq("id", req.user_id)
+            .limit(1)
+            .execute()
+        )
+        if profile_result.data and len(profile_result.data) > 0:
+            user_tier = profile_result.data[0].get("tier", "free")
+    except Exception as e:
+        print(f"[API] Warning: could not fetch user tier, defaulting to free: {e}")
+
+    allowed_engines = TIER_ENGINES.get(user_tier, TIER_ENGINES["free"])
+    if req.task_type not in allowed_engines:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your {user_tier} plan does not include the '{req.task_type}' engine. Upgrade to unlock all 4 engines.",
+        )
+
+    # === CHECK COIN BALANCE ===
+    try:
+        ledger_result = (
+            db.table("usage_ledger")
+            .select("coins_balance")
+            .eq("user_id", req.user_id)
+            .limit(1)
+            .execute()
+        )
+        if ledger_result.data and len(ledger_result.data) > 0:
+            balance = ledger_result.data[0].get("coins_balance", 0)
+            if balance < req.coins_reserved:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"Not enough coins. You need {req.coins_reserved} but have {balance}.",
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] Warning: could not verify coin balance: {e}")
+
+    # === INSERT TASK ===
     insert_data = {
         "user_id": req.user_id,
         "task_type": req.task_type,
@@ -95,19 +181,31 @@ async def create_task(req: TaskCreateRequest):
         "status": "pending",
         "coins_reserved": req.coins_reserved,
     }
-    # Store country/region if provided
     if req.country:
         insert_data["country"] = req.country
     if req.state_region:
         insert_data["state_region"] = req.state_region
 
     result = db.table("tasks").insert(insert_data).execute()
+
+    # === DEDUCT COINS (reserve them) ===
+    try:
+        db.rpc("deduct_coins", {
+            "p_user_id": req.user_id,
+            "p_amount": req.coins_reserved,
+        }).execute()
+    except Exception as e:
+        print(f"[API] Warning: could not deduct coins: {e}")
+
     return {"success": True, "task": result.data}
 
 
 @app.get("/api/task/{task_id}")
-async def get_task_status(task_id: str):
-    """Get the status of a specific task by its ID."""
+async def get_task_status(task_id: str, x_api_secret: Optional[str] = Header(None)):
+    """Get the status of a specific task by its ID, including leads if completed."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
     from supabase_client import get_supabase
     db = get_supabase()
     result = (
@@ -156,8 +254,11 @@ async def get_task_status(task_id: str):
 
 
 @app.get("/api/tasks/{user_id}")
-async def get_user_tasks(user_id: str):
+async def get_user_tasks(user_id: str, x_api_secret: Optional[str] = Header(None)):
     """Get all tasks for a specific user. user_id is Clerk ID (TEXT string)."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
     from supabase_client import get_supabase
     db = get_supabase()
     result = (
@@ -171,8 +272,11 @@ async def get_user_tasks(user_id: str):
 
 
 @app.get("/api/leads/{collection_id}")
-async def get_collection_leads(collection_id: str):
+async def get_collection_leads(collection_id: str, x_api_secret: Optional[str] = Header(None)):
     """Get all leads in a specific Smart Collection."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
     from supabase_client import get_supabase
     db = get_supabase()
     result = (
@@ -184,48 +288,15 @@ async def get_collection_leads(collection_id: str):
     return {"leads": result.data}
 
 
-@app.get("/api/cache/check")
-async def check_cache(company_name: str = "", website_url: str = ""):
-    """Check the global cache for existing leads."""
-    from supabase_client import get_supabase
-    db = get_supabase()
-    result = db.rpc("check_global_cache", {
-        "p_company_name": company_name,
-        "p_website_url": website_url,
-    }).execute()
-    return {"cache_hits": result.data}
-
-
-@app.post("/api/coins/deduct")
-async def deduct_coins(req: CoinOperationRequest):
-    """Deduct coins from a user's ledger. Accepts JSON body."""
-    from supabase_client import get_supabase
-    db = get_supabase()
-    result = db.rpc("deduct_coins", {
-        "p_user_id": req.user_id,
-        "p_amount": req.amount,
-    }).execute()
-    return {"success": result.data}
-
-
-@app.post("/api/coins/add")
-async def add_coins(req: CoinOperationRequest):
-    """Add coins to a user's ledger after payment. Accepts JSON body."""
-    from supabase_client import get_supabase
-    db = get_supabase()
-    db.rpc("add_coins", {
-        "p_user_id": req.user_id,
-        "p_amount": req.amount,
-    }).execute()
-    return {"success": True}
-
-
 # ============================================================
-# COIN BALANCE ENDPOINT (was missing!)
+# COIN ENDPOINTS
 # ============================================================
 @app.get("/api/coins/{user_id}")
-async def get_coin_balance(user_id: str):
+async def get_coin_balance(user_id: str, x_api_secret: Optional[str] = Header(None)):
     """Get a user's coin balance. user_id is Clerk ID (TEXT string)."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
     from supabase_client import get_supabase
     db = get_supabase()
     result = (
@@ -253,6 +324,59 @@ async def get_coin_balance(user_id: str):
     }
 
 
+@app.post("/api/coins/deduct")
+async def deduct_coins(req: CoinOperationRequest, x_api_secret: Optional[str] = Header(None)):
+    """Deduct coins from a user's ledger."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = db.rpc("deduct_coins", {
+        "p_user_id": req.user_id,
+        "p_amount": req.amount,
+    }).execute()
+    return {"success": result.data}
+
+
+@app.post("/api/coins/add")
+async def add_coins(req: CoinOperationRequest, x_api_secret: Optional[str] = Header(None)):
+    """Add coins to a user's ledger after payment."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    db.rpc("add_coins", {
+        "p_user_id": req.user_id,
+        "p_amount": req.amount,
+    }).execute()
+    return {"success": True}
+
+
+# ============================================================
+# USER PROFILE ENDPOINT (for tier check from frontend)
+# ============================================================
+@app.get("/api/profile/{user_id}")
+async def get_user_profile(user_id: str, x_api_secret: Optional[str] = Header(None)):
+    """Get a user's profile including their tier."""
+    if not verify_api_secret(x_api_secret):
+        raise HTTPException(status_code=401, detail="Invalid API secret")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("profiles")
+        .select("id, email, full_name, tier, created_at")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"profile": result.data[0]}
+
+
 # ============================================================
 # START THE TASK WORKER IN THE BACKGROUND
 # ============================================================
@@ -260,8 +384,13 @@ async def get_coin_balance(user_id: str):
 async def startup_event():
     """Start the background task worker when server starts."""
     import asyncio
-    from task_worker.worker import run_task_worker
-    asyncio.create_task(run_task_worker())
+    try:
+        from task_worker.worker import run_task_worker
+        asyncio.create_task(run_task_worker())
+        print("[STARTUP] Background task worker started.")
+    except Exception as e:
+        print(f"[STARTUP] Could not start task worker: {e}")
+        print("[STARTUP] Server will run but tasks will not be processed automatically.")
 
 
 # ============================================================
