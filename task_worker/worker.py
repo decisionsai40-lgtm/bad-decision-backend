@@ -136,6 +136,7 @@ async def _process_task(task: Dict[str, Any]):
         # Step 4: Create a Smart Collection for this search
         collection = await _create_smart_collection(
             user_id=user_id,
+            task_id=task_id,
             name=query,
             task_type=task_type,
         )
@@ -178,12 +179,13 @@ async def _update_task_status(task_id: str, status: str):
         print(f"[WORKER] Error updating task {task_id}: {e}")
 
 
-async def _create_smart_collection(user_id: str, name: str, task_type: str) -> str:
+async def _create_smart_collection(user_id: str, task_id: str, name: str, task_type: str) -> str:
     """Create a Smart Collection (folder) for this search's results."""
     try:
         db = get_supabase()
         result = db.table("smart_collections").insert({
             "user_id": user_id,
+            "task_id": task_id,
             "name": name,
             "task_type": task_type,
         }).execute()
