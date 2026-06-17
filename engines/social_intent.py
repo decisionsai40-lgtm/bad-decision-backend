@@ -15,6 +15,7 @@ Targets: Reddit, Twitter/X, Facebook groups, LinkedIn posts
 """
 
 import json
+import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Callable, Optional
 
@@ -23,11 +24,11 @@ from scraping.stealth_fetcher import (
     extract_text_from_html,
     build_github_search_url,
     build_reddit_search_url,
-    build_google_search_url,
 )
+from scraping.serper_search import serper_search, build_serper_query_for_social
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
 
 
 async def run_social_intent(
@@ -46,43 +47,58 @@ async def run_social_intent(
     time_str = one_hour_ago.strftime("%Y-%m-%d %H:%M UTC")
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data from social platforms
+    # PHASE 1: Fetch real data from social platforms (CONCURRENTLY)
     # --------------------------------------------------------
+    # PRIMARY: Serper.dev for site:reddit.com OR site:twitter.com social intent queries
+    # SUPPLEMENTARY: Scrapling fetch of Reddit search
+    # SUPPLEMENTARY: Scrapling fetch of GitHub search
+    # All fetched concurrently with asyncio.gather
     if progress_callback:
-        await progress_callback(15, "Searching Reddit, GitHub, and social platforms for people asking for help...")
+        await progress_callback(15, "Searching Reddit, Twitter, and GitHub for people asking for help...")
 
-    print(f"[SOCIAL_INTENT] Fetching social intent data for '{query}'")
+    print(f"[SOCIAL_INTENT] Fetching social intent data for '{query}' (concurrent sources)")
+
+    serper_query = build_serper_query_for_social(query)
+    reddit_url = build_reddit_search_url(query)
+    github_url = build_github_search_url(query)
+
+    serper_results, reddit_result, github_result = await asyncio.gather(
+        serper_search(serper_query, num_results=20),
+        stealth_fetch(reddit_url, timeout=SOURCE_TIMEOUT),
+        stealth_fetch(github_url, timeout=SOURCE_TIMEOUT),
+        return_exceptions=True,
+    )
 
     scraped_texts = []
 
-    # Source 1: Reddit search (sorted by newest)
-    reddit_url = build_reddit_search_url(query)
-    reddit_result = await stealth_fetch(reddit_url, timeout=15)
-    if reddit_result:
+    # Process Serper.dev results (PRIMARY — replaces Google scraping)
+    if isinstance(serper_results, list) and serper_results:
+        serper_text = "\n".join(
+            f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
+            for r in serper_results
+        )
+        scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
+        print(f"[SOCIAL_INTENT] Serper.dev returned {len(serper_results)} results")
+    elif isinstance(serper_results, Exception):
+        print(f"[SOCIAL_INTENT] Serper.dev error: {serper_results}")
+
+    # Process Reddit result
+    if isinstance(reddit_result, dict) and reddit_result:
         text = extract_text_from_html(reddit_result["html"])
         if text:
             scraped_texts.append({"source": "Reddit", "content": text})
             print(f"[SOCIAL_INTENT] Scraped Reddit: {len(text)} chars")
+    elif isinstance(reddit_result, Exception):
+        print(f"[SOCIAL_INTENT] Reddit error: {reddit_result}")
 
-    # Source 2: GitHub Issues/Discussions
-    github_url = build_github_search_url(query)
-    github_result = await stealth_fetch(github_url, timeout=15)
-    if github_result:
+    # Process GitHub result
+    if isinstance(github_result, dict) and github_result:
         text = extract_text_from_html(github_result["html"])
         if text:
             scraped_texts.append({"source": "GitHub", "content": text})
             print(f"[SOCIAL_INTENT] Scraped GitHub: {len(text)} chars")
-
-    # Source 3: Google search for social intent signals
-    google_url = build_google_search_url(
-        f"{query} site:reddit.com OR site:twitter.com OR site:github.com \"looking for\" OR \"need help\" OR \"hiring\""
-    )
-    google_result = await stealth_fetch(google_url, timeout=15)
-    if google_result:
-        text = extract_text_from_html(google_result["html"])
-        if text:
-            scraped_texts.append({"source": "Google Search (social focus)", "content": text})
-            print(f"[SOCIAL_INTENT] Scraped Google Search: {len(text)} chars")
+    elif isinstance(github_result, Exception):
+        print(f"[SOCIAL_INTENT] GitHub error: {github_result}")
 
     if not scraped_texts:
         print(f"[SOCIAL_INTENT] All sources failed — no data to process")

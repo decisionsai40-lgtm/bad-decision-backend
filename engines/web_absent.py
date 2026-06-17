@@ -16,6 +16,7 @@ DROP the row. These businesses need a website built for them.
 """
 
 import json
+import asyncio
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Callable, Optional
 
@@ -25,14 +26,14 @@ from scraping.stealth_fetcher import (
     extract_links_from_html,
     build_yelp_search_url,
     build_houzz_search_url,
-    build_google_search_url,
 )
+from scraping.serper_search import serper_search, build_serper_query_for_aggregators
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
 
 
 async def run_web_absent(
@@ -47,43 +48,60 @@ async def run_web_absent(
     lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data from aggregator sites
+    # PHASE 1: Fetch real data from aggregator sites (CONCURRENTLY)
     # --------------------------------------------------------
+    # PRIMARY: Serper.dev for site:yelp.com OR site:houzz.com OR site:etsy.com queries
+    # SUPPLEMENTARY: Scrapling fetch of Yelp search page
+    # SUPPLEMENTARY: Scrapling fetch of Houzz search page
+    # All fetched concurrently with asyncio.gather
     if progress_callback:
         await progress_callback(15, "Searching Yelp, Houzz, and Etsy for businesses without websites...")
 
-    print(f"[WEB_ABSENT] Fetching aggregator data for '{query}'")
+    print(f"[WEB_ABSENT] Fetching aggregator data for '{query}' (concurrent sources)")
+
+    serper_query = build_serper_query_for_aggregators(query)
+    yelp_url = build_yelp_search_url(query, state_region or country)
+    houzz_url = build_houzz_search_url(query)
+
+    serper_results, yelp_result, houzz_result = await asyncio.gather(
+        serper_search(serper_query, num_results=20),
+        stealth_fetch(yelp_url, timeout=SOURCE_TIMEOUT),
+        stealth_fetch(houzz_url, timeout=SOURCE_TIMEOUT),
+        return_exceptions=True,
+    )
 
     scraped_texts = []
 
-    # Source 1: Yelp search
-    yelp_url = build_yelp_search_url(query, state_region or country)
-    yelp_result = await stealth_fetch(yelp_url, timeout=15)
-    if yelp_result:
+    # Process Serper.dev results (PRIMARY — replaces Google scraping)
+    if isinstance(serper_results, list) and serper_results:
+        serper_text = "\n".join(
+            f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
+            for r in serper_results
+        )
+        scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text, "links": [r.get("link", "") for r in serper_results if r.get("link")]})
+        print(f"[WEB_ABSENT] Serper.dev returned {len(serper_results)} results")
+    elif isinstance(serper_results, Exception):
+        print(f"[WEB_ABSENT] Serper.dev error: {serper_results}")
+
+    # Process Yelp result
+    if isinstance(yelp_result, dict) and yelp_result:
         text = extract_text_from_html(yelp_result["html"])
         links = extract_links_from_html(yelp_result["html"], base_url="https://www.yelp.com")
         if text:
             scraped_texts.append({"source": "Yelp", "content": text, "links": links})
             print(f"[WEB_ABSENT] Scraped Yelp: {len(text)} chars, {len(links)} links")
+    elif isinstance(yelp_result, Exception):
+        print(f"[WEB_ABSENT] Yelp error: {yelp_result}")
 
-    # Source 2: Houzz search
-    houzz_url = build_houzz_search_url(query)
-    houzz_result = await stealth_fetch(houzz_url, timeout=15)
-    if houzz_result:
+    # Process Houzz result
+    if isinstance(houzz_result, dict) and houzz_result:
         text = extract_text_from_html(houzz_result["html"])
         links = extract_links_from_html(houzz_result["html"], base_url="https://www.houzz.com")
         if text:
             scraped_texts.append({"source": "Houzz", "content": text, "links": links})
             print(f"[WEB_ABSENT] Scraped Houzz: {len(text)} chars, {len(links)} links")
-
-    # Source 3: Google search for businesses on aggregator sites
-    google_url = build_google_search_url(f"{query} site:yelp.com OR site:houzz.com OR site:etsy.com")
-    google_result = await stealth_fetch(google_url, timeout=15)
-    if google_result:
-        text = extract_text_from_html(google_result["html"])
-        if text:
-            scraped_texts.append({"source": "Google Search (aggregator focus)", "content": text})
-            print(f"[WEB_ABSENT] Scraped Google Search: {len(text)} chars")
+    elif isinstance(houzz_result, Exception):
+        print(f"[WEB_ABSENT] Houzz error: {houzz_result}")
 
     if not scraped_texts:
         print(f"[WEB_ABSENT] All sources failed — no data to process")

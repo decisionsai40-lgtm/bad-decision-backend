@@ -4,8 +4,9 @@ BAD DECISION — Engine 2: Local SMB Maps
 This engine finds local brick-and-mortar businesses.
 
 PIPELINE:
-  1. Fetch local business data (OSM Overpass in Tier 3, Scrapling for now)
-  2. DeepSeek structures the scraped text into clean lead objects
+  1. Fetch local business data from OSM (Overpass + Nominatim) + Serper.dev CONCURRENTLY
+     (OSM replaces Google Maps scraping — Google Maps requires JS and fails on Render free tier)
+  2. DeepSeek structures the data into clean lead objects
   3. HARD FILTER: Drop any entity with > 50 employees or no physical address
   4. Validation gates run based on tier:
        - Free: Gate 1 (DNS)
@@ -17,22 +18,23 @@ a physical address. We only want small businesses.
 """
 
 import json
+import asyncio
 from typing import List, Dict, Any, Callable, Optional
 
 from scraping.stealth_fetcher import (
     stealth_fetch,
     extract_text_from_html,
-    build_google_maps_url,
-    build_google_search_url,
     build_opencorporates_url,
 )
+from scraping.osm_search import search_local_businesses
+from scraping.serper_search import serper_search
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
 
 
 async def run_smb_maps(
@@ -52,50 +54,152 @@ async def run_smb_maps(
     search_query = f"{query} {location}".strip() if location else query
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data
+    # PHASE 1: Fetch real data (CONCURRENTLY)
     # --------------------------------------------------------
+    # PRIMARY: OpenStreetMap (Overpass + Nominatim) — replaces Google Maps
+    # SUPPLEMENTARY: Serper.dev for Google search results
+    # SUPPLEMENTARY: OpenCorporates for company registry data
+    # All 3 sources fetched concurrently with asyncio.gather
     if progress_callback:
-        await progress_callback(15, f"Searching for local businesses in {location or 'your area'}...")
+        await progress_callback(15, f"Searching OpenStreetMap for local businesses in {location or 'your area'}...")
 
-    print(f"[SMB_MAPS] Fetching local business data for '{search_query}'")
+    print(f"[SMB_MAPS] Fetching local business data for '{search_query}' (concurrent sources)")
+
+    location_string = ", ".join([p for p in [state_region, country] if p]) if (state_region or country) else query
+
+    osm_task = search_local_businesses(query, location=location_string, limit=lead_target)
+    serper_task = serper_search(f"{search_query} local small business", num_results=20)
+    oc_task = stealth_fetch(build_opencorporates_url(query), timeout=SOURCE_TIMEOUT)
+
+    osm_businesses, serper_results, oc_result = await asyncio.gather(
+        osm_task,
+        serper_task,
+        oc_task,
+        return_exceptions=True,
+    )
 
     scraped_texts = []
+    osm_leads_direct = []  # OSM returns structured businesses we can use directly
 
-    # Source 1: Google Maps search
-    maps_url = build_google_maps_url(search_query)
-    maps_result = await stealth_fetch(maps_url, timeout=15)
-    if maps_result:
-        text = extract_text_from_html(maps_result["html"])
-        if text:
-            scraped_texts.append({"source": "Google Maps", "content": text})
-            print(f"[SMB_MAPS] Scraped Google Maps: {len(text)} chars")
+    # Process OSM results (structured business data — can be used directly without DeepSeek)
+    if isinstance(osm_businesses, list) and osm_businesses:
+        print(f"[SMB_MAPS] OSM returned {len(osm_businesses)} businesses")
+        # Convert OSM businesses to lead format directly (skip DeepSeek structuring for these)
+        for biz in osm_businesses[:lead_target]:
+            if biz.get("name"):
+                osm_leads_direct.append({
+                    "company_name": biz.get("name", "ABSENT"),
+                    "website_url": biz.get("website", "ABSENT") or "ABSENT",
+                    "address": biz.get("address", "ABSENT") or "ABSENT",
+                    "phone": biz.get("phone", "ABSENT") or "ABSENT",
+                    "email": biz.get("email", "ABSENT") or "ABSENT",
+                    "source": "openstreetmap",
+                })
+    elif isinstance(osm_businesses, Exception):
+        print(f"[SMB_MAPS] OSM error: {osm_businesses}")
 
-    # Source 2: Google search for local businesses
-    google_url = build_google_search_url(f"{search_query} local small business")
-    google_result = await stealth_fetch(google_url, timeout=15)
-    if google_result:
-        text = extract_text_from_html(google_result["html"])
-        if text:
-            scraped_texts.append({"source": "Google Search", "content": text})
-            print(f"[SMB_MAPS] Scraped Google Search: {len(text)} chars")
+    # Process Serper.dev results
+    if isinstance(serper_results, list) and serper_results:
+        serper_text = "\n".join(
+            f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
+            for r in serper_results
+        )
+        scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
+        print(f"[SMB_MAPS] Serper.dev returned {len(serper_results)} results")
+    elif isinstance(serper_results, Exception):
+        print(f"[SMB_MAPS] Serper.dev error: {serper_results}")
 
-    # Source 3: OpenCorporates
-    oc_url = build_opencorporates_url(query)
-    oc_result = await stealth_fetch(oc_url, timeout=15)
-    if oc_result:
+    # Process OpenCorporates result
+    if isinstance(oc_result, dict) and oc_result:
         text = extract_text_from_html(oc_result["html"])
         if text:
             scraped_texts.append({"source": "OpenCorporates", "content": text})
             print(f"[SMB_MAPS] Scraped OpenCorporates: {len(text)} chars")
+    elif isinstance(oc_result, Exception):
+        print(f"[SMB_MAPS] OpenCorporates error: {oc_result}")
 
-    if not scraped_texts:
+    # If OSM gave us direct leads, process them through validation gates (skip DeepSeek structuring)
+    if osm_leads_direct:
+        if progress_callback:
+            await progress_callback(40, f"Validating {len(osm_leads_direct)} businesses from OpenStreetMap...")
+
+        for biz in osm_leads_direct:
+            company_name = biz["company_name"]
+            website_url = biz["website_url"]
+            address = biz["address"]
+
+            # HARD FILTER: Must have physical address
+            if address == "ABSENT" or not address:
+                continue
+
+            domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
+
+            # Gate 1: DNS Check
+            gates_passed = 0
+            if website_url != "ABSENT":
+                domain_ok, has_mx = await check_dns(website_url)
+                if not domain_ok:
+                    continue
+                gates_passed = 1
+
+            # Use OSM-provided contact data directly
+            lead = {
+                "domain_hash": domain_hash,
+                "company_name": company_name,
+                "website_url": website_url,
+                "dm_name": "ABSENT",
+                "dm_position": "ABSENT",
+                "verified_email": biz.get("email", "ABSENT"),
+                "is_catchall": False,
+                "linkedin": "ABSENT",
+                "instagram": "ABSENT",
+                "facebook": "ABSENT",
+                "phone": biz.get("phone", "ABSENT"),
+                "address": address,
+                "validation_gates_passed": gates_passed,
+            }
+
+            # Pre-filter: Footprint check
+            if not check_footprint(lead):
+                continue
+
+            # Gate 2: SMTP (Starter+)
+            if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
+                smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
+                lead["is_catchall"] = is_catchall
+                if not smtp_ok and not is_catchall:
+                    continue
+                gates_passed = 2
+                lead["validation_gates_passed"] = gates_passed
+
+            # Gate 3: DeepSeek AI (Pro only)
+            if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+                deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
+                if not deepseek_ok:
+                    continue
+                if is_role:
+                    lead["is_catchall"] = True
+                gates_passed = 3
+                lead["validation_gates_passed"] = gates_passed
+
+            leads.append(lead)
+
+        print(f"[SMB_MAPS] OSM direct leads after validation: {len(leads)}")
+
+    # If we still need more leads, run DeepSeek structuring on the scraped text
+    if len(leads) < lead_target and scraped_texts:
+        combined_text = "\n\n".join(
+            f"--- SOURCE: {s['source']} ---\n{s['content']}"
+            for s in scraped_texts
+        )
+        # Fall through to DeepSeek structuring phase below
+    elif not scraped_texts and not osm_leads_direct:
         print(f"[SMB_MAPS] All sources failed — no data to process")
-        return []
-
-    combined_text = "\n\n".join(
-        f"--- SOURCE: {s['source']} ---\n{s['content']}"
-        for s in scraped_texts
-    )
+        return leads
+    else:
+        # We have enough OSM leads and no scraped text to process
+        print(f"[SMB_MAPS] Returning {len(leads)} leads from OSM")
+        return leads
 
     # --------------------------------------------------------
     # PHASE 2: DeepSeek — Structure the scraped data

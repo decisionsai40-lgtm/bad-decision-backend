@@ -5,7 +5,7 @@ This engine finds businesses that are actively running ads
 (Facebook, Google, TikTok).
 
 PIPELINE:
-  1. Fetch ad library data + search results (Serper.dev in Tier 3, Scrapling for now)
+  1. Fetch ad library data (Scrapling) + Google search results (Serper.dev) CONCURRENTLY
   2. DeepSeek structures the scraped text into clean lead objects
   3. DeepSeek enriches each lead with decision maker details
   4. Validation gates run based on tier:
@@ -18,21 +18,22 @@ That makes them a hot lead for agencies and service providers.
 """
 
 import json
+import asyncio
 from typing import List, Dict, Any, Callable, Optional
 
 from scraping.stealth_fetcher import (
     stealth_fetch,
     extract_text_from_html,
     build_meta_ads_library_url,
-    build_google_search_url,
 )
+from scraping.serper_search import serper_search, build_serper_query_for_ads
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek, is_role_address
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
 
 
 async def run_ads_intent(
@@ -59,32 +60,46 @@ async def run_ads_intent(
     lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data from the web
+    # PHASE 1: Fetch real data from the web (CONCURRENTLY)
     # --------------------------------------------------------
     if progress_callback:
         await progress_callback(15, "Searching ad libraries and Google for businesses running ads...")
 
-    print(f"[ADS_INTENT] Fetching ad data for '{query}'")
+    print(f"[ADS_INTENT] Fetching ad data for '{query}' (concurrent sources)")
+
+    # Source 1: Meta Ads Library via Scrapling (static HTML, no JS needed)
+    # Source 2: Google search via Serper.dev (returns clean JSON, no scraping)
+    # Fetch BOTH concurrently with asyncio.gather
+    meta_url = build_meta_ads_library_url(query)
+    serper_query = build_serper_query_for_ads(query)
+
+    meta_result, serper_results = await asyncio.gather(
+        stealth_fetch(meta_url, timeout=SOURCE_TIMEOUT),
+        serper_search(serper_query, num_results=20),
+        return_exceptions=True,
+    )
 
     scraped_texts = []
 
-    # Source 1: Meta Ads Library (public, no login required)
-    meta_url = build_meta_ads_library_url(query)
-    meta_result = await stealth_fetch(meta_url, timeout=15)
-    if meta_result:
+    # Process Meta Ads Library result
+    if isinstance(meta_result, dict) and meta_result:
         text = extract_text_from_html(meta_result["html"])
         if text:
             scraped_texts.append({"source": "Meta Ads Library", "content": text})
             print(f"[ADS_INTENT] Scraped Meta Ads Library: {len(text)} chars")
+    elif isinstance(meta_result, Exception):
+        print(f"[ADS_INTENT] Meta Ads Library fetch error: {meta_result}")
 
-    # Source 2: Google search for businesses running ads
-    google_url = build_google_search_url(f"{query} running ads advertising")
-    google_result = await stealth_fetch(google_url, timeout=15)
-    if google_result:
-        text = extract_text_from_html(google_result["html"])
-        if text:
-            scraped_texts.append({"source": "Google Search", "content": text})
-            print(f"[ADS_INTENT] Scraped Google Search: {len(text)} chars")
+    # Process Serper.dev results (clean JSON — format as text for DeepSeek)
+    if isinstance(serper_results, list) and serper_results:
+        serper_text = "\n".join(
+            f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
+            for r in serper_results
+        )
+        scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
+        print(f"[ADS_INTENT] Serper.dev returned {len(serper_results)} results")
+    elif isinstance(serper_results, Exception):
+        print(f"[ADS_INTENT] Serper.dev error: {serper_results}")
 
     if not scraped_texts:
         print(f"[ADS_INTENT] All sources failed — no data to process")
