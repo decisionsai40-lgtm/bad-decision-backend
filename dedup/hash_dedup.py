@@ -1,158 +1,147 @@
 """
-BAD DECISION AI — O(1) Hash Deduplication
-==========================================
-Before we scrape a website, we check if we've already found
-this lead before. If we have (and it's less than 30 days old),
-we return the cached data instantly for 0 COINS.
+BAD DECISION — Query-Level Cache
+=================================
+Before we run a search, we check if we've already searched for
+the same query + engine combination recently. If we have (within
+30 days), we return the cached leads instantly.
+
+IMPORTANT: Credits are STILL charged on cached queries (per the
+handoff brief section 1 "Credits Are ALWAYS Deducted"). The cache
+only speeds up the response — it does not make searches free.
 
 How it works:
-1. Take the website URL and hash it using SHA-256
-2. Check the global_intelligence_cache table for this hash
-3. If found AND verified within 30 days → return cached data (FREE!)
-4. If not found or stale → proceed with scraping
-
-This means users NEVER pay for the same data twice.
-The SHA-256 hash guarantees O(1) lookup speed —
-even with millions of rows, the check is instant.
+  1. Normalize the query (lowercase, trim, collapse spaces).
+  2. Combine with the task_type (engine).
+  3. Hash with SHA-256 to get a unique query_hash.
+  4. Check global_intelligence_cache for this hash.
+  5. If found AND verified within CACHE_FRESHNESS_DAYS (30) → return cached leads.
+  6. If not found or stale → return None (engine will run).
 """
 
 import hashlib
-from typing import Tuple, Optional, Dict, Any
+import json
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 
 from supabase_client import get_supabase
 from config import CACHE_FRESHNESS_DAYS
 
 
-def compute_hash(url: str) -> str:
+def compute_query_hash(query: str, task_type: str) -> str:
     """
-    Create a SHA-256 hash from a URL.
+    Create a SHA-256 hash from a normalized query + task_type.
 
-    Think of it like a fingerprint for a website.
-    Every unique URL gets a unique fingerprint.
-    The same URL always produces the same fingerprint.
+    This gives every unique (query, engine) combination a unique hash.
+    The same query + engine always produces the same hash.
+    """
+    # Normalize: lowercase, strip, collapse whitespace
+    normalized = " ".join(query.lower().strip().split())
+    combined = f"{normalized}|{task_type}"
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
-    Args:
-        url: The website URL to hash
 
-    Returns:
-        A 64-character hex string (the hash/fingerprint)
+def compute_domain_hash(url: str) -> str:
+    """
+    Create a SHA-256 hash from a URL or company name.
+    Used for within-task dedup (checking if the same lead appears twice).
     """
     if not url or url == "ABSENT":
         url = "unknown"
-
-    # Normalize: lowercase, strip trailing slashes
     url = url.lower().strip().rstrip("/")
-
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
-async def check_duplicate(domain_hash: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+async def check_query_cache(query_hash: str) -> Optional[List[Dict[str, Any]]]:
     """
-    Check if we already have this lead in our global cache.
-
-    Args:
-        domain_hash: The SHA-256 hash to look up
+    Check if we have fresh cached results for this query_hash.
 
     Returns:
-        (is_duplicate, cached_data)
-        - is_duplicate: True = we already have this lead
-        - cached_data: The lead data if found, None if not found
+        List of leads if cache hit (and fresh), None if cache miss or stale.
     """
-
     try:
         db = get_supabase()
 
         result = (
             db.table("global_intelligence_cache")
-            .select("*")
-            .eq("domain_hash", domain_hash)
+            .select("leads_json, lead_count, verified_at")
+            .eq("query_hash", query_hash)
+            .limit(1)
             .execute()
         )
 
-        if result.data and len(result.data) > 0:
-            cached = result.data[0]
+        if not result.data:
+            return None
 
-            # Check if the data is still fresh (within 30 days)
-            from datetime import datetime, timedelta
-            last_verified = cached.get("last_verified_at")
+        cached = result.data[0]
+        verified_at = cached.get("verified_at")
 
-            if last_verified:
-                # Parse the timestamp
-                if isinstance(last_verified, str):
-                    last_verified = datetime.fromisoformat(last_verified.replace("Z", "+00:00"))
+        # Check freshness
+        if verified_at:
+            if isinstance(verified_at, str):
+                verified_at = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
 
-                # Is it still fresh?
-                if datetime.now(last_verified.tzinfo) - last_verified < timedelta(days=CACHE_FRESHNESS_DAYS):
-                    print(f"[DEDUP] Cache HIT for {domain_hash[:12]}... — returning cached data (0 coins)")
-                    return True, cached
-                else:
-                    print(f"[DEDUP] Cache STALE for {domain_hash[:12]}... — re-scraping")
-                    return False, None
+            age = datetime.now(verified_at.tzinfo) - verified_at
+            if age > timedelta(days=CACHE_FRESHNESS_DAYS):
+                print(f"[CACHE] STALE for {query_hash[:12]}... (age: {age.days} days) — re-running search")
+                return None
 
-            # No timestamp but we have data — return it anyway
-            return True, cached
+        leads_json = cached.get("leads_json", [])
+        lead_count = cached.get("lead_count", len(leads_json))
 
-        # Not found in cache
-        return False, None
+        print(f"[CACHE] HIT for {query_hash[:12]}... — returning {lead_count} cached leads")
+        return leads_json
 
     except Exception as e:
-        print(f"[DEDUP] Cache check error: {e}")
-        return False, None
+        print(f"[CACHE] Check error: {e}")
+        return None
 
 
-async def save_to_cache(lead: Dict[str, Any]) -> bool:
+async def save_query_cache(
+    query_hash: str,
+    query_text: str,
+    task_type: str,
+    leads: List[Dict[str, Any]],
+) -> bool:
     """
-    Save a verified lead to the global cache.
+    Save search results to the query cache for future queries.
 
-    This is called AFTER a lead passes all validation gates.
-    Future users searching for the same business will get
-    this data instantly for 0 coins.
-
-    Args:
-        lead: The lead dictionary to save
-
-    Returns:
-        True = saved successfully, False = error
+    This is called AFTER a search completes successfully.
+    Future users searching for the same query will get these results instantly.
     """
-
     try:
         db = get_supabase()
 
-        # Only save the fields that belong in the global cache
+        # Serialize leads to JSON. Remove any non-serializable values.
+        clean_leads = []
+        for lead in leads:
+            clean_lead = {}
+            for k, v in lead.items():
+                try:
+                    json.dumps(v)  # Test if serializable
+                    clean_lead[k] = v
+                except (TypeError, ValueError):
+                    clean_lead[k] = str(v)
+            clean_leads.append(clean_lead)
+
         cache_data = {
-            "domain_hash": lead.get("domain_hash"),
-            "company_name": lead.get("company_name", "ABSENT"),
-            "website_url": lead.get("website_url", "ABSENT"),
-            "dm_name": lead.get("dm_name", "ABSENT"),
-            "dm_position": lead.get("dm_position", "ABSENT"),
-            "verified_email": lead.get("verified_email", "ABSENT"),
-            "is_catchall": lead.get("is_catchall", False),
-            "linkedin": lead.get("linkedin", "ABSENT"),
-            "instagram": lead.get("instagram", "ABSENT"),
-            "phone": lead.get("phone", "ABSENT"),
-            # Engine-specific fields (only present in certain engine types)
-            "ad_platform": lead.get("ad_platform", "ABSENT"),
-            "address": lead.get("address", "ABSENT"),
-            "aggregator_source": lead.get("aggregator_source", "ABSENT"),
-            "aggregator_url": lead.get("aggregator_url", "ABSENT"),
-            "platform": lead.get("platform", "ABSENT"),
-            "intent_text": lead.get("intent_text", "ABSENT"),
+            "query_hash": query_hash,
+            "query_text": query_text,
+            "task_type": task_type,
+            "leads_json": clean_leads,
+            "lead_count": len(clean_leads),
+            "verified_at": datetime.utcnow().isoformat(),
         }
 
-        # Remove ABSENT fields that don't have a column in the DB
-        # (Supabase will error if we try to insert a column that doesn't exist)
-        cache_data = {k: v for k, v in cache_data.items() if v is not None}
-
-        # Use upsert (insert or update if hash already exists)
-        result = (
+        # Upsert (insert or update if query_hash already exists)
+        (
             db.table("global_intelligence_cache")
-            .upsert(cache_data, on_conflict="domain_hash")
+            .upsert(cache_data, on_conflict="query_hash")
             .execute()
         )
 
-        print(f"[DEDUP] Saved {lead.get('company_name')} to global cache")
+        print(f"[CACHE] Saved {len(clean_leads)} leads for query '{query_text[:50]}...'")
         return True
 
     except Exception as e:
-        print(f"[DEDUP] Save error: {e}")
+        print(f"[CACHE] Save error: {e}")
         return False

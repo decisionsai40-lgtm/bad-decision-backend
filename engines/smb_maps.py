@@ -1,22 +1,23 @@
 """
-BAD DECISION AI — Engine 2: Local Businesses — Brick & Mortar (Scrapling-First)
-================================================================================
-This engine finds local businesses by scraping Google Maps search
-results and Google search, then cross-referencing with OpenCorporates.
+BAD DECISION — Engine 2: Local SMB Maps
+========================================
+This engine finds local brick-and-mortar businesses.
 
-PIPELINE (as specified in TRD Section 4):
-1. Scrapling fetches REAL data from Google Maps + Google search + OpenCorporates
-2. DeepSeek structures the scraped HTML/text into clean lead objects
-3. HARD FILTER: Drop any entity with > 50 employees or no physical address
-4. Validation gates run (DNS → Footprint → SMTP based on tier)
-5. Dedup & cache
+PIPELINE:
+  1. Fetch local business data (OSM Overpass in Tier 3, Scrapling for now)
+  2. DeepSeek structures the scraped text into clean lead objects
+  3. HARD FILTER: Drop any entity with > 50 employees or no physical address
+  4. Validation gates run based on tier:
+       - Free: Gate 1 (DNS)
+       - Starter/Growth: Gate 1 + Gate 2 (DNS + SMTP)
+       - Pro: Gate 1 + Gate 2 + Gate 3 (DNS + SMTP + DeepSeek)
 
 HARD RULE: Drop any entity with > 50 employees or lacking
-local physical coordinates. We only want small businesses.
+a physical address. We only want small businesses.
 """
 
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable, Optional
 
 from scraping.stealth_fetcher import (
     stealth_fetch,
@@ -29,97 +30,87 @@ from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
-from dedup.hash_dedup import compute_hash, check_duplicate
+from validation.gate_deepseek import check_deepseek
+from dedup.hash_dedup import compute_domain_hash
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
 
 
 async def run_smb_maps(
     query: str,
     user_tier: str = "free",
+    country: str = "",
+    state_region: str = "",
+    progress_callback: Optional[Callable] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Find local brick-and-mortar businesses matching the user's query.
-
-    PIPELINE:
-    1. Scrapling fetches Google Maps + Google search + OpenCorporates
-    2. DeepSeek structures scraped text into lead objects
-    3. Hard filters: <50 employees, must have physical address
-    4. DeepSeek enriches each lead with DM contact details
-    5. Validation gates run based on tier
-    """
-
+    """Find local brick-and-mortar businesses matching the user's query."""
     leads = []
+    lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
+
+    # Build location string for search
+    location_parts = [p for p in [state_region, country] if p]
+    location = ", ".join(location_parts) if location_parts else ""
+    search_query = f"{query} {location}".strip() if location else query
 
     # --------------------------------------------------------
-    # PHASE 1: SCRAPLING — Fetch real data from the web
+    # PHASE 1: Fetch real data
     # --------------------------------------------------------
-    print(f"[SMB_MAPS] Scrapling Phase: Fetching local business data for '{query}'")
+    if progress_callback:
+        await progress_callback(15, f"Searching for local businesses in {location or 'your area'}...")
+
+    print(f"[SMB_MAPS] Fetching local business data for '{search_query}'")
 
     scraped_texts = []
 
-    # Source 1: Google Maps search (public, no API key needed for basic search)
-    maps_url = build_google_maps_url(query)
-    maps_result = await stealth_fetch(maps_url)
+    # Source 1: Google Maps search
+    maps_url = build_google_maps_url(search_query)
+    maps_result = await stealth_fetch(maps_url, timeout=15)
     if maps_result:
         text = extract_text_from_html(maps_result["html"])
         if text:
-            scraped_texts.append({
-                "source": "Google Maps",
-                "content": text,
-            })
+            scraped_texts.append({"source": "Google Maps", "content": text})
             print(f"[SMB_MAPS] Scraped Google Maps: {len(text)} chars")
-    else:
-        print(f"[SMB_MAPS] Google Maps fetch failed — continuing with other sources")
 
     # Source 2: Google search for local businesses
-    google_url = build_google_search_url(f"{query} local small business near me")
-    google_result = await stealth_fetch(google_url)
+    google_url = build_google_search_url(f"{search_query} local small business")
+    google_result = await stealth_fetch(google_url, timeout=15)
     if google_result:
         text = extract_text_from_html(google_result["html"])
         if text:
-            scraped_texts.append({
-                "source": "Google Search",
-                "content": text,
-            })
+            scraped_texts.append({"source": "Google Search", "content": text})
             print(f"[SMB_MAPS] Scraped Google Search: {len(text)} chars")
-    else:
-        print(f"[SMB_MAPS] Google Search fetch failed")
 
-    # Source 3: OpenCorporates (public corporate registry)
+    # Source 3: OpenCorporates
     oc_url = build_opencorporates_url(query)
-    oc_result = await stealth_fetch(oc_url)
+    oc_result = await stealth_fetch(oc_url, timeout=15)
     if oc_result:
         text = extract_text_from_html(oc_result["html"])
         if text:
-            scraped_texts.append({
-                "source": "OpenCorporates",
-                "content": text,
-            })
+            scraped_texts.append({"source": "OpenCorporates", "content": text})
             print(f"[SMB_MAPS] Scraped OpenCorporates: {len(text)} chars")
-    else:
-        print(f"[SMB_MAPS] OpenCorporates fetch failed")
 
     if not scraped_texts:
-        print(f"[SMB_MAPS] All Scrapling sources failed — no data to process")
+        print(f"[SMB_MAPS] All sources failed — no data to process")
         return []
 
-    # Combine all scraped content for DeepSeek
     combined_text = "\n\n".join(
         f"--- SOURCE: {s['source']} ---\n{s['content']}"
         for s in scraped_texts
     )
 
     # --------------------------------------------------------
-    # PHASE 2: DEEPSEEK — Structure the scraped data
+    # PHASE 2: DeepSeek — Structure the scraped data
     # --------------------------------------------------------
-    print(f"[SMB_MAPS] DeepSeek Phase: Structuring scraped data")
+    if progress_callback:
+        await progress_callback(35, "AI is analyzing data and extracting local business names...")
+
+    print(f"[SMB_MAPS] DeepSeek structuring phase")
 
     structure_prompt = f"""
     You are a local business data extractor. Below is REAL TEXT scraped from the internet
-    about local businesses related to: "{query}"
+    about local businesses related to: "{search_query}"
 
     Your job is to extract REAL businesses mentioned in this text.
     Do NOT invent or hallucinate businesses that are not in the text.
-    Only extract businesses that are clearly named in the scraped content.
 
     HARD RULES:
     - Each business MUST have fewer than 50 employees (if mentioned)
@@ -131,11 +122,11 @@ async def run_smb_maps(
 
     For each REAL business you find, provide:
     - company_name: The exact business name as mentioned
-    - website_url: Their website (or "ABSENT" if not found)
+    - website_url: Their website (or "ABSENT")
     - address: Their physical street address if mentioned (or "ABSENT")
     - employee_count: Approximate number of employees if mentioned (or "ABSENT")
 
-    Return a JSON object with a "businesses" array. Find up to 25 businesses.
+    Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
     If you cannot find data for a field, write "ABSENT".
 
     Example format:
@@ -151,6 +142,7 @@ async def run_smb_maps(
     }}
     """
 
+    businesses = []
     try:
         response = await execute_llm_payload({
             "model": DEEPSEEK_SCOUT_MODEL,
@@ -163,25 +155,23 @@ async def run_smb_maps(
         })
 
         content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-
-        try:
-            parsed = json.loads(content)
-            businesses = parsed.get("businesses", parsed.get("results", []))
-            if isinstance(parsed, list):
-                businesses = parsed
-        except json.JSONDecodeError:
-            businesses = []
+        parsed = json.loads(content)
+        businesses = parsed.get("businesses", parsed.get("results", []))
+        if isinstance(parsed, list):
+            businesses = parsed
 
     except Exception as e:
         print(f"[SMB_MAPS] DeepSeek structuring error: {e}")
-        businesses = []
 
-    print(f"[SMB_MAPS] DeepSeek extracted {len(businesses)} candidate businesses from scraped data")
+    print(f"[SMB_MAPS] DeepSeek extracted {len(businesses)} candidate businesses")
 
     # --------------------------------------------------------
-    # PHASE 3: FILTER, VALIDATE & ENRICH each business
+    # PHASE 3: FILTER, VALIDATE & ENRICH
     # --------------------------------------------------------
-    for biz in businesses[:25]:
+    if progress_callback:
+        await progress_callback(50, f"Filtering and enriching {min(len(businesses), lead_target)} local businesses...")
+
+    for biz in businesses[:lead_target]:
         company_name = biz.get("company_name", "ABSENT")
         website_url = biz.get("website_url", "ABSENT")
         address = biz.get("address", "ABSENT")
@@ -197,30 +187,25 @@ async def run_smb_maps(
                 print(f"[SMB_MAPS] {company_name} has {employee_count} employees — DROPPED (>50)")
                 continue
         except (ValueError, TypeError):
-            pass  # If we can't parse employee count, let it through
+            pass
 
-        # HARD FILTER: Must have physical address (coordinates)
+        # HARD FILTER: Must have physical address
         if address == "ABSENT" or not address:
             print(f"[SMB_MAPS] {company_name} has no physical address — DROPPED")
             continue
 
-        # Dedup check
-        url_to_hash = website_url if website_url != "ABSENT" else company_name
-        domain_hash = compute_hash(url_to_hash)
-
-        is_dup, cached_data = await check_duplicate(domain_hash)
-        if is_dup and cached_data:
-            leads.append(cached_data)
-            continue
+        domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
 
         # Gate 1: DNS Check
+        gates_passed = 0
         if website_url != "ABSENT":
-            dns_ok = await check_dns(website_url)
-            if not dns_ok:
+            domain_ok, has_mx = await check_dns(website_url)
+            if not domain_ok:
                 print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
                 continue
+            gates_passed = 1
 
-        # Enrich with DeepSeek (Scrapling visits website first)
+        # Enrich with DeepSeek
         enrichment = await _enrich_local_lead(company_name, website_url, address, user_tier)
 
         lead = {
@@ -233,27 +218,41 @@ async def run_smb_maps(
             "is_catchall": False,
             "linkedin": enrichment.get("linkedin", "ABSENT"),
             "instagram": enrichment.get("instagram", "ABSENT"),
+            "facebook": enrichment.get("facebook", "ABSENT"),
             "phone": enrichment.get("phone", "ABSENT"),
             "address": address,
+            "validation_gates_passed": gates_passed,
         }
 
-        # Gate 2: Footprint (Starter+)
-        if user_tier in ("starter", "growth", "pro"):
-            footprint_ok = check_footprint(lead)
-            if not footprint_ok:
-                print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
-                continue
+        # Pre-filter: Footprint check
+        if not check_footprint(lead):
+            print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
+            continue
 
-        # Gate 3: SMTP (Pro only)
-        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+        # Gate 2: SMTP (Starter+)
+        if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
             smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
             lead["is_catchall"] = is_catchall
             if not smtp_ok and not is_catchall:
                 print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
                 continue
+            gates_passed = 2
+            lead["validation_gates_passed"] = gates_passed
+
+        # Gate 3: DeepSeek AI (Pro only)
+        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+            deepseek_ok, is_role, reason = await check_deepseek(lead["verified_email"], company_name)
+            if not deepseek_ok:
+                print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
+                continue
+            if is_role:
+                lead["is_catchall"] = True
+            gates_passed = 3
+            lead["validation_gates_passed"] = gates_passed
 
         leads.append(lead)
 
+    print(f"[SMB_MAPS] Returning {len(leads)} verified leads")
     return leads
 
 
@@ -263,19 +262,14 @@ async def _enrich_local_lead(
     address: str,
     user_tier: str,
 ) -> Dict[str, str]:
-    """
-    Enrich a local business lead with DM details.
-    Scrapling fetches the company website first, then DeepSeek extracts contact info.
-    """
+    """Enrich a local business lead with DM details."""
     scraped_website_text = ""
 
-    # Try to scrape the company website for contact info
     if website_url and website_url != "ABSENT":
-        print(f"[SMB_MAPS] Scrapling: Fetching company website {website_url}")
-        site_result = await stealth_fetch(website_url)
+        print(f"[SMB_MAPS] Fetching company website {website_url}")
+        site_result = await stealth_fetch(website_url, timeout=15)
         if site_result:
             scraped_website_text = extract_text_from_html(site_result["html"], max_chars=8000)
-            print(f"[SMB_MAPS] Scraped company website: {len(scraped_website_text)} chars")
 
     if scraped_website_text:
         prompt = f"""
@@ -288,6 +282,7 @@ async def _enrich_local_lead(
         - verified_email: Their work or business email
         - linkedin: Their LinkedIn profile URL
         - instagram: The business Instagram URL
+        - facebook: The business Facebook URL
         - phone: The business phone number
 
         SCRAPED WEBSITE CONTENT:
@@ -308,6 +303,7 @@ async def _enrich_local_lead(
         - verified_email: Their work or business email
         - linkedin: Their LinkedIn profile URL
         - instagram: The business Instagram URL
+        - facebook: The business Facebook URL
         - phone: The business phone number
 
         If you cannot find any piece of information, write "ABSENT".
@@ -336,5 +332,6 @@ async def _enrich_local_lead(
             "verified_email": "ABSENT",
             "linkedin": "ABSENT",
             "instagram": "ABSENT",
+            "facebook": "ABSENT",
             "phone": "ABSENT",
         }

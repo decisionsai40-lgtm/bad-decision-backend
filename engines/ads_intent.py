@@ -1,21 +1,24 @@
 """
-BAD DECISION AI — Engine 1: Digital Ads Intelligence (Scrapling-First)
-======================================================================
-This engine scrapes Meta Ads Library and Google search to find
-businesses that are actively running ads.
+BAD DECISION — Engine 1: Ads Intelligence
+==========================================
+This engine finds businesses that are actively running ads
+(Facebook, Google, TikTok).
 
-PIPELINE (as specified in TRD Section 4):
-1. Scrapling fetches REAL data from ad libraries and search engines
-2. DeepSeek structures the scraped HTML/text into clean lead objects
-3. Validation gates run (DNS → Footprint → SMTP based on tier)
-4. Dedup & cache
+PIPELINE:
+  1. Fetch ad library data + search results (Serper.dev in Tier 3, Scrapling for now)
+  2. DeepSeek structures the scraped text into clean lead objects
+  3. DeepSeek enriches each lead with decision maker details
+  4. Validation gates run based on tier:
+       - Free: Gate 1 (DNS — domain exists + MX)
+       - Starter/Growth: Gate 1 + Gate 2 (DNS + SMTP)
+       - Pro: Gate 1 + Gate 2 + Gate 3 (DNS + SMTP + DeepSeek)
 
 Why? If a business is spending money on ads, they have a marketing budget.
 That makes them a hot lead for agencies and service providers.
 """
 
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable, Optional
 
 from scraping.stealth_fetcher import (
     stealth_fetch,
@@ -27,81 +30,78 @@ from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
-from dedup.hash_dedup import compute_hash, check_duplicate
+from validation.gate_deepseek import check_deepseek, is_role_address
+from dedup.hash_dedup import compute_domain_hash
+from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID
 
 
 async def run_ads_intent(
     query: str,
     user_tier: str = "free",
+    country: str = "",
+    state_region: str = "",
+    progress_callback: Optional[Callable] = None,
 ) -> List[Dict[str, Any]]:
     """
     Search for companies running ads based on the user's query.
 
-    PIPELINE:
-    1. Scrapling fetches pages from Meta Ads Library + Google search
-    2. DeepSeek structures the raw scraped text into lead objects
-    3. DeepSeek enriches each lead with DM contact details
-    4. Validation gates run (DNS → Footprint → SMTP)
-
     Args:
         query: What the user typed (e.g., "roofers in Texas")
         user_tier: Their subscription level (free/starter/growth/pro)
+        country: Country code (e.g., "US")
+        state_region: State/region name
+        progress_callback: Async callback(progress: int, step: str) for UI updates
 
     Returns:
         List of lead dictionaries with all extracted data
     """
-
     leads = []
+    lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
 
     # --------------------------------------------------------
-    # PHASE 1: SCRAPLING — Fetch real data from the web
+    # PHASE 1: Fetch real data from the web
     # --------------------------------------------------------
-    print(f"[ADS_INTENT] Scrapling Phase: Fetching ad data for '{query}'")
+    if progress_callback:
+        await progress_callback(15, "Searching ad libraries and Google for businesses running ads...")
+
+    print(f"[ADS_INTENT] Fetching ad data for '{query}'")
 
     scraped_texts = []
 
     # Source 1: Meta Ads Library (public, no login required)
     meta_url = build_meta_ads_library_url(query)
-    meta_result = await stealth_fetch(meta_url)
+    meta_result = await stealth_fetch(meta_url, timeout=15)
     if meta_result:
         text = extract_text_from_html(meta_result["html"])
         if text:
-            scraped_texts.append({
-                "source": "Meta Ads Library",
-                "content": text,
-            })
+            scraped_texts.append({"source": "Meta Ads Library", "content": text})
             print(f"[ADS_INTENT] Scraped Meta Ads Library: {len(text)} chars")
-    else:
-        print(f"[ADS_INTENT] Meta Ads Library fetch failed — continuing with other sources")
 
     # Source 2: Google search for businesses running ads
     google_url = build_google_search_url(f"{query} running ads advertising")
-    google_result = await stealth_fetch(google_url)
+    google_result = await stealth_fetch(google_url, timeout=15)
     if google_result:
         text = extract_text_from_html(google_result["html"])
         if text:
-            scraped_texts.append({
-                "source": "Google Search",
-                "content": text,
-            })
+            scraped_texts.append({"source": "Google Search", "content": text})
             print(f"[ADS_INTENT] Scraped Google Search: {len(text)} chars")
-    else:
-        print(f"[ADS_INTENT] Google Search fetch failed")
 
     if not scraped_texts:
-        print(f"[ADS_INTENT] All Scrapling sources failed — no data to process")
+        print(f"[ADS_INTENT] All sources failed — no data to process")
         return []
 
-    # Combine all scraped content for DeepSeek
     combined_text = "\n\n".join(
         f"--- SOURCE: {s['source']} ---\n{s['content']}"
         for s in scraped_texts
     )
 
     # --------------------------------------------------------
-    # PHASE 2: DEEPSEEK — Structure the scraped data
+    # PHASE 2: DeepSeek — Structure the scraped data
     # --------------------------------------------------------
-    print(f"[ADS_INTENT] DeepSeek Phase: Structuring scraped data")
+    if progress_callback:
+        await progress_callback(35, "AI is analyzing scraped data and extracting business names...")
+
+    print(f"[ADS_INTENT] DeepSeek structuring phase")
 
     structure_prompt = f"""
     You are a business data extractor. Below is REAL TEXT scraped from the internet
@@ -109,17 +109,16 @@ async def run_ads_intent(
 
     Your job is to extract REAL businesses mentioned in this text.
     Do NOT invent or hallucinate businesses that are not in the text.
-    Only extract companies that are clearly named in the scraped content.
 
     SCRAPED CONTENT:
     {combined_text[:12000]}
 
     For each REAL business you find, provide:
     - company_name: The exact business name as mentioned
-    - website_url: Their website domain if mentioned (or "ABSENT" if not found)
+    - website_url: Their website domain if mentioned (or "ABSENT")
     - ad_platform: Which platform they advertise on if mentioned (or "ABSENT")
 
-    Return a JSON object with a "businesses" array. Find up to 25 businesses.
+    Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
     If you cannot find data for a field, write "ABSENT".
 
     Example format:
@@ -134,6 +133,7 @@ async def run_ads_intent(
     }}
     """
 
+    businesses = []
     try:
         response = await execute_llm_payload({
             "model": DEEPSEEK_SCOUT_MODEL,
@@ -146,59 +146,44 @@ async def run_ads_intent(
         })
 
         content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-
-        try:
-            parsed = json.loads(content)
-            businesses = parsed.get("businesses", parsed.get("results", []))
-            if isinstance(parsed, list):
-                businesses = parsed
-        except json.JSONDecodeError:
-            businesses = []
+        parsed = json.loads(content)
+        businesses = parsed.get("businesses", parsed.get("results", []))
+        if isinstance(parsed, list):
+            businesses = parsed
 
     except Exception as e:
         print(f"[ADS_INTENT] DeepSeek structuring error: {e}")
-        businesses = []
 
-    print(f"[ADS_INTENT] DeepSeek extracted {len(businesses)} candidate businesses from scraped data")
+    print(f"[ADS_INTENT] DeepSeek extracted {len(businesses)} candidate businesses")
 
     # --------------------------------------------------------
-    # PHASE 3: VALIDATE & ENRCH each business
+    # PHASE 3: VALIDATE & ENRICH each business
     # --------------------------------------------------------
-    for biz in businesses[:25]:
+    if progress_callback:
+        await progress_callback(50, f"Validating and enriching {min(len(businesses), lead_target)} businesses...")
+
+    for biz in businesses[:lead_target]:
         company_name = biz.get("company_name", "ABSENT")
         website_url = biz.get("website_url", "ABSENT")
         ad_platform = biz.get("ad_platform", "ABSENT")
 
-        # Skip if no company name
         if company_name == "ABSENT" or not company_name:
             continue
 
-        # Compute hash for dedup check
-        url_to_hash = website_url if website_url != "ABSENT" else company_name
-        domain_hash = compute_hash(url_to_hash)
+        domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
 
-        # Check if we already have this lead cached
-        is_dup, cached_data = await check_duplicate(domain_hash)
-        if is_dup and cached_data:
-            leads.append(cached_data)
-            continue
-
-        # --------------------------------------------------------
-        # Gate 1: DNS Check (ALL tiers get this)
-        # --------------------------------------------------------
+        # Gate 1: DNS Check (ALL tiers)
+        gates_passed = 0
         if website_url != "ABSENT":
-            dns_ok = await check_dns(website_url)
-            if not dns_ok:
+            domain_ok, has_mx = await check_dns(website_url)
+            if not domain_ok:
                 print(f"[ADS_INTENT] DNS failed for {website_url} — DROPPED")
                 continue
+            gates_passed = 1
 
-        # --------------------------------------------------------
-        # DeepSeek Enrichment — find decision maker details
-        # (also visits the company website via Scrapling if possible)
-        # --------------------------------------------------------
+        # Enrich with DeepSeek
         enrichment = await _enrich_lead(company_name, website_url, user_tier)
 
-        # Build the lead object
         lead = {
             "domain_hash": domain_hash,
             "company_name": company_name,
@@ -209,31 +194,41 @@ async def run_ads_intent(
             "is_catchall": False,
             "linkedin": enrichment.get("linkedin", "ABSENT"),
             "instagram": enrichment.get("instagram", "ABSENT"),
+            "facebook": enrichment.get("facebook", "ABSENT"),
             "phone": enrichment.get("phone", "ABSENT"),
             "ad_platform": ad_platform,
+            "validation_gates_passed": gates_passed,
         }
 
-        # --------------------------------------------------------
-        # Gate 2: Footprint Check (Starter tier and above)
-        # --------------------------------------------------------
-        if user_tier in ("starter", "growth", "pro"):
-            footprint_ok = check_footprint(lead)
-            if not footprint_ok:
-                print(f"[ADS_INTENT] Footprint failed for {company_name} — DROPPED")
-                continue
+        # Pre-filter: Footprint check (all tiers — drops leads with zero contact methods)
+        if not check_footprint(lead):
+            print(f"[ADS_INTENT] Footprint failed for {company_name} — no contact method, DROPPED")
+            continue
 
-        # --------------------------------------------------------
-        # Gate 3: SMTP Check (Pro tier only)
-        # --------------------------------------------------------
-        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+        # Gate 2: SMTP Check (Starter, Growth, Pro)
+        if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
             smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
             lead["is_catchall"] = is_catchall
             if not smtp_ok and not is_catchall:
                 print(f"[ADS_INTENT] SMTP failed for {lead['verified_email']} — DROPPED")
                 continue
+            gates_passed = 2
+            lead["validation_gates_passed"] = gates_passed
+
+        # Gate 3: DeepSeek AI Check (Pro only)
+        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+            deepseek_ok, is_role, reason = await check_deepseek(lead["verified_email"], company_name)
+            if not deepseek_ok:
+                print(f"[ADS_INTENT] DeepSeek Gate 3 rejected {lead['verified_email']}: {reason} — DROPPED")
+                continue
+            if is_role:
+                lead["is_catchall"] = True  # Flag role addresses
+            gates_passed = 3
+            lead["validation_gates_passed"] = gates_passed
 
         leads.append(lead)
 
+    print(f"[ADS_INTENT] Returning {len(leads)} verified leads")
     return leads
 
 
@@ -242,27 +237,15 @@ async def _enrich_lead(
     website_url: str,
     user_tier: str,
 ) -> Dict[str, str]:
-    """
-    Enrich a lead with decision maker details.
-    Uses Scrapling to visit the company website first (if available),
-    then passes the scraped content to DeepSeek to extract contact info.
-
-    PIPELINE:
-    1. Scrapling fetches the company's website (if they have one)
-    2. DeepSeek structures the website content into DM contact details
-    3. Falls back to DeepSeek knowledge only if website fetch fails
-    """
+    """Enrich a lead with decision maker details using DeepSeek + website scraping."""
     scraped_website_text = ""
 
-    # Try to scrape the company website for contact info
     if website_url and website_url != "ABSENT":
-        print(f"[ADS_INTENT] Scrapling: Fetching company website {website_url}")
-        site_result = await stealth_fetch(website_url)
+        print(f"[ADS_INTENT] Fetching company website {website_url}")
+        site_result = await stealth_fetch(website_url, timeout=15)
         if site_result:
             scraped_website_text = extract_text_from_html(site_result["html"], max_chars=8000)
-            print(f"[ADS_INTENT] Scraped company website: {len(scraped_website_text)} chars")
 
-    # Build the enrichment prompt — use scraped content if available
     if scraped_website_text:
         prompt = f"""
         You are an expert business researcher. Below is REAL TEXT scraped from the website of:
@@ -274,30 +257,31 @@ async def _enrich_lead(
         - verified_email: Their work email address
         - linkedin: Their LinkedIn profile URL
         - instagram: The company's Instagram URL
+        - facebook: The company's Facebook URL
         - phone: The company phone number
 
         SCRAPED WEBSITE CONTENT:
         {scraped_website_text[:8000]}
 
         Only extract information that is clearly present in the scraped text.
-        If you cannot find any piece of information, you MUST write "ABSENT" (not null, not empty).
+        If you cannot find any piece of information, you MUST write "ABSENT".
         Return a single JSON object.
         """
     else:
-        # Fallback: Ask DeepSeek to use its knowledge (less reliable but better than nothing)
         prompt = f"""
         You are an expert business researcher. Find the key decision maker
         for this company: "{company_name}" ({website_url})
 
         Look for:
         - dm_name: Full name of the CEO, founder, or owner
-        - dm_position: Their job title (CEO, Founder, Owner, etc.)
+        - dm_position: Their job title
         - verified_email: Their work email address
         - linkedin: Their LinkedIn profile URL
         - instagram: The company's Instagram URL
+        - facebook: The company's Facebook URL
         - phone: The company phone number
 
-        If you cannot find any piece of information, you MUST write "ABSENT" (not null, not empty).
+        If you cannot find any piece of information, write "ABSENT".
         Return a single JSON object.
         """
 
@@ -323,5 +307,6 @@ async def _enrich_lead(
             "verified_email": "ABSENT",
             "linkedin": "ABSENT",
             "instagram": "ABSENT",
+            "facebook": "ABSENT",
             "phone": "ABSENT",
         }

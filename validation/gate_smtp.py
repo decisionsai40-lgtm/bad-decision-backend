@@ -1,32 +1,30 @@
 """
-BAD DECISION AI — Gate 3: SMTP Handshake Check
-================================================
-This is the SLOWEST but most important check. We actually
-connect to the email server and ask: "Does this email address
-exist?" This guarantees a real human will receive the email.
+BAD DECISION — Gate 2: SMTP Mailbox Verification
+=================================================
+This is the MEDIUM-speed check. We connect to the email server and
+ask: "Does this mailbox actually exist?"
 
 How it works:
-1. Connect to the email server (like knocking on the door)
-2. Say "Hello, I'm a mail server" (EHLO greeting)
-3. Say "I want to send mail from test@example.com" (MAIL FROM)
-4. Say "I want to deliver to target@company.com" (RCPT TO)
-5. If the server says "OK, that person exists" → VERIFIED!
-6. If the server says "No such person" → DROP this lead
+  1. Find the mail server (MX record) for the email's domain.
+  2. Connect to it on port 25.
+  3. Say hello (EHLO).
+  4. Say who we're sending from (MAIL FROM).
+  5. Ask if the recipient exists (RCPT TO).
+  6. If the server says "OK" → the email exists.
+  7. If the server says "No such user" → the email doesn't exist.
 
-Catch-All Trap: Some email servers say "yes" to EVERY address
-(even fake ones like "asdfasdf@company.com"). We detect this
-by testing a random fake address first. If the server accepts
+Catch-All Trap: Some servers say "yes" to EVERY address (even fake ones).
+We detect this by testing a random fake address. If the server accepts
 the fake one too, we flag it as is_catchall = TRUE.
 
 Speed: Slow (2-10 seconds per email)
-Who gets it: Pro tier ONLY
+Who gets it: Starter, Growth, Pro (NOT Free tier)
 """
 
 import smtplib
 import dns.resolver
 import random
 import string
-from urllib.parse import urlparse
 from typing import Tuple
 
 
@@ -39,75 +37,68 @@ async def check_smtp(email_address: str) -> Tuple[bool, bool]:
 
     Returns:
         (is_valid, is_catchall)
-        - is_valid: True = email likely exists, False = email definitely doesn't exist
-        - is_catchall: True = server accepts everything (unreliable), False = server is selective
+        - is_valid: True = email likely exists, False = email doesn't exist
+        - is_catchall: True = server accepts everything (unreliable)
     """
-
     if not email_address or email_address == "ABSENT":
         return False, False
 
+    if "@" not in email_address:
+        return False, False
+
     try:
-        # Step 1: Find the mail server for this domain
         domain = email_address.split("@")[1]
         mx_records = dns.resolver.resolve(domain, "MX")
 
         if not mx_records:
-            print(f"[GATE3-SMTP] No MX record for {domain}")
+            print(f"[GATE2-SMTP] No MX record for {domain}")
             return False, False
 
-        # Get the highest priority mail server
         mx_record = str(sorted(mx_records, key=lambda r: r.preference)[0].exchange).rstrip(".")
-        print(f"[GATE3-SMTP] Mail server for {domain}: {mx_record}")
+        print(f"[GATE2-SMTP] Mail server for {domain}: {mx_record}")
 
     except Exception as e:
-        print(f"[GATE3-SMTP] MX lookup failed for {domain}: {e}")
+        print(f"[GATE2-SMTP] MX lookup failed for {domain}: {e}")
         return False, False
 
     try:
-        # Step 2: Connect to the mail server
         server = smtplib.SMTP(timeout=10)
         server.connect(mx_record, 25)
+        server.ehlo("verify.baddecision.app")
+        server.mail("verify@baddecision.app")
 
-        # Step 3: Say hello (EHLO greeting)
-        server.ehlo("verify.baddecision.ai")
-
-        # Step 4: Say who we're sending from
-        server.mail("verify@baddecision.ai")
-
-        # Step 5: Check if the target email exists
+        # Check if the target email exists
         code, message = server.rcpt(email_address)
         target_exists = code == 250
 
-        # Step 6: Catch-All Trap — test a random fake address
+        # Catch-All Trap: test a random fake address
         random_user = "".join(random.choices(string.ascii_lowercase, k=15))
         fake_email = f"{random_user}@{domain}"
         code_fake, _ = server.rcpt(fake_email)
         is_catchall = code_fake == 250
 
-        # Step 7: Close the connection
         server.quit()
 
-        # Results
         if is_catchall:
-            print(f"[GATE3-SMTP] {email_address} — CATCH-ALL DETECTED (server accepts everything)")
-            return True, True  # Accept it but flag it
+            print(f"[GATE2-SMTP] {email_address} — CATCH-ALL DETECTED")
+            return True, True
 
         if target_exists:
-            print(f"[GATE3-SMTP] {email_address} — VERIFIED (email exists)")
+            print(f"[GATE2-SMTP] {email_address} — VERIFIED")
             return True, False
 
-        print(f"[GATE3-SMTP] {email_address} — REJECTED (email does not exist)")
+        print(f"[GATE2-SMTP] {email_address} — REJECTED (mailbox does not exist)")
         return False, False
 
     except smtplib.SMTPServerDisconnected:
-        print(f"[GATE3-SMTP] {email_address} — Server disconnected")
+        print(f"[GATE2-SMTP] {email_address} — Server disconnected")
         return False, False
 
     except smtplib.SMTPConnectError:
-        print(f"[GATE3-SMTP] {email_address} — Connection failed")
+        print(f"[GATE2-SMTP] {email_address} — Connection failed")
         return False, False
 
     except Exception as e:
-        print(f"[GATE3-SMTP] {email_address} — Error: {e}")
-        # If we can't check, assume it's valid (don't drop on network errors)
+        print(f"[GATE2-SMTP] {email_address} — Error: {e}")
+        # On network errors, assume valid (don't drop on transient failures)
         return True, False
