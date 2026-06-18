@@ -139,41 +139,31 @@ async def _process_task(task: Dict[str, Any]):
     await _update_task(task_id, status="processing", progress=5, current_step="Starting search engine...")
 
     try:
-        # Step 2: Check the query cache
+        # Step 2: ALWAYS run fresh search (user wants fresh leads every time)
+        # We still SAVE results to cache for database building, but we never
+        # return cached results instead of running a fresh search.
         query_hash = compute_query_hash(query, task_type)
 
-        await _update_task(task_id, progress=10, current_step="Checking cache for previous results...")
+        await _update_task(task_id, progress=15, current_step="Fetching fresh data from web sources...")
 
-        cached_leads = await check_query_cache(query_hash)
+        engine_func = ENGINE_MAP.get(task_type)
+        if not engine_func:
+            print(f"[WORKER] Unknown task_type: {task_type}")
+            await _fail_task(task_id, user_id, credits_reserved, f"Unknown engine: {task_type}")
+            return
 
-        leads = []
-        if cached_leads:
-            # Cache HIT — use cached leads (but STILL charge credits per the brief)
-            print(f"[WORKER] Cache HIT for query — returning {len(cached_leads)} cached leads (credits still charged)")
-            leads = cached_leads
-            await _update_task(task_id, progress=70, current_step=f"Found {len(leads)} cached leads. Saving...")
-        else:
-            # Cache MISS — run the engine
-            await _update_task(task_id, progress=15, current_step="Fetching data from web sources...")
+        # Run the engine with a progress callback
+        leads = await engine_func(
+            query=query,
+            user_tier=user_tier,
+            country=country,
+            state_region=state_region,
+            progress_callback=_make_progress_callback(task_id),
+        )
 
-            engine_func = ENGINE_MAP.get(task_type)
-            if not engine_func:
-                print(f"[WORKER] Unknown task_type: {task_type}")
-                await _fail_task(task_id, user_id, credits_reserved, f"Unknown engine: {task_type}")
-                return
-
-            # Run the engine with a progress callback
-            leads = await engine_func(
-                query=query,
-                user_tier=user_tier,
-                country=country,
-                state_region=state_region,
-                progress_callback=_make_progress_callback(task_id),
-            )
-
-            # Save to cache for future queries
-            if leads:
-                await save_query_cache(query_hash, query, task_type, leads)
+        # Save to cache for database building (but always run fresh searches)
+        if leads:
+            await save_query_cache(query_hash, query, task_type, leads)
 
         # Step 3: Handle the results
         if not leads:

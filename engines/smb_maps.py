@@ -67,16 +67,32 @@ async def run_smb_maps(
 
     location_string = ", ".join([p for p in [state_region, country] if p]) if (state_region or country) else query
 
+    # Make MULTIPLE Serper searches with different query variations to get more results.
+    # Serper free tier returns max 10 per call, so we make 5 calls concurrently.
+    serper_queries = [
+        f"{search_query} local business",
+        f"{search_query} near {location_string}",
+        f"{search_query} directory {location_string}",
+        f"{search_query} services {location_string}",
+        f"{search_query} company {location_string}",
+    ]
+
     osm_task = search_local_businesses(query, location=location_string, radius=50000, limit=lead_target)
-    serper_task = serper_search(f"{search_query} local small business", num_results=50)
+    serper_tasks = [serper_search(q, num_results=10) for q in serper_queries]
     oc_task = stealth_fetch(build_opencorporates_url(query), timeout=SOURCE_TIMEOUT)
 
-    osm_businesses, serper_results, oc_result = await asyncio.gather(
+    # Gather all tasks concurrently
+    all_results = await asyncio.gather(
         osm_task,
-        serper_task,
+        *serper_tasks,
         oc_task,
         return_exceptions=True,
     )
+
+    # Unpack results
+    osm_businesses = all_results[0]
+    serper_results_list = all_results[1:6]  # 5 Serper results
+    oc_result = all_results[6]
 
     scraped_texts = []
     osm_leads_direct = []  # OSM returns structured businesses we can use directly
@@ -98,14 +114,29 @@ async def run_smb_maps(
     elif isinstance(osm_businesses, Exception):
         print(f"[SMB_MAPS] OSM error: {osm_businesses}")
 
-    # Process Serper.dev results
-    if isinstance(serper_results, list) and serper_results:
-        serper_text = "\n".join(
+    # Process ALL Serper.dev results (from 5 concurrent searches)
+    all_serper_results = []
+    for i, serper_results in enumerate(serper_results_list):
+        if isinstance(serper_results, list) and serper_results:
+            all_serper_results.extend(serper_results)
+            print(f"[SMB_MAPS] Serper search {i+1} returned {len(serper_results)} results")
+
+    if all_serper_results:
+        # Deduplicate by URL
+        seen_urls = set()
+        unique_serper = []
+        for r in all_serper_results:
+            url = r.get('link', '')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_serper.append(r)
+
+        serper_text = "\n\n".join(
             f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
-            for r in serper_results
+            for r in unique_serper
         )
         scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
-        print(f"[SMB_MAPS] Serper.dev returned {len(serper_results)} results")
+        print(f"[SMB_MAPS] Total unique Serper results: {len(unique_serper)}")
     elif isinstance(serper_results, Exception):
         print(f"[SMB_MAPS] Serper.dev error: {serper_results}")
 
@@ -213,17 +244,21 @@ async def run_smb_maps(
     You are a local business data extractor. Below is REAL TEXT scraped from the internet
     about local businesses related to: "{search_query}"
 
-    Your job is to extract REAL businesses mentioned in this text.
+    Your job is to extract EVERY REAL business mentioned in this text.
+    Be AGGRESSIVE — extract as many businesses as you can find. Do NOT skip any.
     Do NOT invent or hallucinate businesses that are not in the text.
 
     RULES:
-    - Extract every real business you can find
+    - Extract EVERY real business you can find — aim for 20-50 businesses
     - If address is not mentioned, set it to "ABSENT" (that's OK — we still want the lead)
     - If website is not mentioned, set it to "ABSENT"
+    - If phone is not mentioned, set it to "ABSENT"
+    - Look for business names in titles, URLs, and snippets
+    - Extract from ALL sources provided
     - NO chains or large corporations (Walmart, McDonald's, etc.)
 
     SCRAPED CONTENT:
-    {combined_text[:12000]}
+    {combined_text[:14000]}
 
     For each REAL business you find, provide:
     - company_name: The exact business name as mentioned
