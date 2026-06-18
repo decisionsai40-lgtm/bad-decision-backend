@@ -208,6 +208,19 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         )
         if profile_result.data and len(profile_result.data) > 0:
             user_tier = profile_result.data[0].get("tier", "free")
+        else:
+            # No profile found — auto-create one (defensive: in case Clerk webhook
+            # hasn't fired yet or failed). This prevents 500 errors.
+            print(f"[API] No profile found for user {req.user_id} — auto-creating default profile")
+            try:
+                db.table("profiles").insert({
+                    "id": req.user_id,
+                    "email": "",
+                    "full_name": "",
+                    "tier": "free",
+                }).execute()
+            except Exception as insert_err:
+                print(f"[API] Could not auto-create profile (may already exist): {insert_err}")
     except Exception as e:
         print(f"[API] Warning: could not fetch user tier, defaulting to free: {e}")
 
@@ -219,6 +232,7 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         )
 
     # === CHECK CREDIT BALANCE ===
+    # Auto-create credit_balances row if it doesn't exist (defensive)
     try:
         ledger_result = (
             db.table("credit_balances")
@@ -229,11 +243,25 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         )
         if ledger_result.data and len(ledger_result.data) > 0:
             balance = ledger_result.data[0].get("credits_balance", 0)
-            if balance < req.credits_reserved:
-                raise HTTPException(
-                    status_code=402,
-                    detail=f"Not enough credits. You need {req.credits_reserved} but have {balance}.",
-                )
+        else:
+            # No credit_balances row — create one with 0 balance
+            print(f"[API] No credit_balances row for user {req.user_id} — auto-creating with 0 balance")
+            try:
+                db.table("credit_balances").insert({
+                    "user_id": req.user_id,
+                    "credits_balance": 0,
+                    "credits_reserved": 0,
+                    "total_purchased": 0,
+                }).execute()
+            except Exception as insert_err:
+                print(f"[API] Could not auto-create credit_balances: {insert_err}")
+            balance = 0
+
+        if balance < req.credits_reserved:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Not enough credits. You need {req.credits_reserved} but have {balance}.",
+            )
     except HTTPException:
         raise
     except Exception as e:
