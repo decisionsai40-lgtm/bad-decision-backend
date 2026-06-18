@@ -211,16 +211,29 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         else:
             # No profile found — auto-create one (defensive: in case Clerk webhook
             # hasn't fired yet or failed). This prevents 500 errors.
+            # Use the user_id as a unique email placeholder to avoid UNIQUE constraint
+            # conflicts (email column is UNIQUE NOT NULL).
             print(f"[API] No profile found for user {req.user_id} — auto-creating default profile")
             try:
-                db.table("profiles").insert({
-                    "id": req.user_id,
-                    "email": "",
-                    "full_name": "",
-                    "tier": "free",
+                db.rpc("handle_new_user", {
+                    "p_clerk_id": req.user_id,
+                    "p_email": f"{req.user_id}@clerk.placeholder",
+                    "p_full_name": "",
+                    "p_country": "US",
                 }).execute()
+                print(f"[API] Auto-created profile + 50 free credits via handle_new_user RPC")
             except Exception as insert_err:
-                print(f"[API] Could not auto-create profile (may already exist): {insert_err}")
+                print(f"[API] handle_new_user RPC failed: {insert_err}")
+                # Last resort: insert profile directly with a unique email
+                try:
+                    db.table("profiles").insert({
+                        "id": req.user_id,
+                        "email": f"{req.user_id}@clerk.placeholder",
+                        "full_name": "",
+                        "tier": "free",
+                    }).execute()
+                except Exception as direct_err:
+                    print(f"[API] Direct profile insert also failed: {direct_err}")
     except Exception as e:
         print(f"[API] Warning: could not fetch user tier, defaulting to free: {e}")
 

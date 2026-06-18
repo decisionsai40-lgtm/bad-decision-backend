@@ -18,7 +18,8 @@ Who gets it: Pro tier ONLY
 import json
 from typing import Tuple
 
-from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCHOLAR_MODEL
+from ai.deepseek_middleware import execute_llm_payload
+from config import DEEPSEEK_SCHOLAR_MODEL
 
 
 # Common role-based email prefixes that are NOT individual people
