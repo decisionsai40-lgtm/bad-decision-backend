@@ -222,10 +222,15 @@ BEGIN
   VALUES (p_clerk_id, 50, 0, 50)
   ON CONFLICT (user_id) DO NOTHING;
 
-  -- Log the signup bonus transaction (idempotent via reference_id)
+  -- Log the signup bonus transaction (check if already exists to avoid duplicates)
+  -- Using WHERE NOT EXISTS instead of ON CONFLICT for compatibility
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-  VALUES (p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id)
-  ON CONFLICT (reference_id, transaction_type) DO NOTHING;
+  SELECT p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id
+  WHERE NOT EXISTS (
+    SELECT 1 FROM credit_transactions
+    WHERE reference_id = 'signup_' || p_clerk_id
+      AND transaction_type = 'signup_bonus'
+  );
 
   RETURN TRUE;
 END;

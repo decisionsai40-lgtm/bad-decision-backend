@@ -212,7 +212,7 @@ async def overpass_search(
         overpass_query = f'[out:json][timeout:25];(node["name"~"{safe_name}",i](around:{radius},{lat or 0},{lon or 0});way["name"~"{safe_name}",i](around:{radius},{lat or 0},{lon or 0}););out center 30;'
 
     try:
-        async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT * 2) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 OSM_OVERPASS_ENDPOINT,
                 data={"data": overpass_query},

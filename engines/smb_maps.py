@@ -216,19 +216,20 @@ async def run_smb_maps(
     Your job is to extract REAL businesses mentioned in this text.
     Do NOT invent or hallucinate businesses that are not in the text.
 
-    HARD RULES:
-    - Each business MUST have fewer than 50 employees (if mentioned)
-    - Each business MUST have a physical street address (no online-only businesses)
-    - NO chains or large corporations
+    RULES:
+    - Extract every real business you can find
+    - If address is not mentioned, set it to "ABSENT" (that's OK — we still want the lead)
+    - If website is not mentioned, set it to "ABSENT"
+    - NO chains or large corporations (Walmart, McDonald's, etc.)
 
     SCRAPED CONTENT:
     {combined_text[:12000]}
 
     For each REAL business you find, provide:
     - company_name: The exact business name as mentioned
-    - website_url: Their website (or "ABSENT")
+    - website_url: Their website URL if mentioned (or "ABSENT")
     - address: Their physical street address if mentioned (or "ABSENT")
-    - employee_count: Approximate number of employees if mentioned (or "ABSENT")
+    - phone: Phone number if mentioned (or "ABSENT")
 
     Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
     If you cannot find data for a field, write "ABSENT".
@@ -240,7 +241,7 @@ async def run_smb_maps(
                 "company_name": "Mike's Roofing LLC",
                 "website_url": "https://mikesroofing.com",
                 "address": "123 Main St, Dallas, TX",
-                "employee_count": "8"
+                "phone": "(555) 123-4567"
             }}
         ]
     }}
@@ -279,24 +280,17 @@ async def run_smb_maps(
         company_name = biz.get("company_name", "ABSENT")
         website_url = biz.get("website_url", "ABSENT")
         address = biz.get("address", "ABSENT")
-        employee_count = biz.get("employee_count", "ABSENT")
+        phone = biz.get("phone", "ABSENT")
 
         # HARD FILTER: Must have a company name
         if company_name == "ABSENT" or not company_name:
             continue
 
-        # HARD FILTER: Must be < 50 employees
-        try:
-            if employee_count != "ABSENT" and int(str(employee_count).strip()) >= 50:
-                print(f"[SMB_MAPS] {company_name} has {employee_count} employees — DROPPED (>50)")
-                continue
-        except (ValueError, TypeError):
-            pass
-
-        # HARD FILTER: Must have physical address
+        # SOFT FILTER: Address is preferred but NOT required.
+        # Many businesses from Serper/Google don't have addresses in snippets,
+        # but they still have websites and contact info. Keep them.
         if address == "ABSENT" or not address:
-            print(f"[SMB_MAPS] {company_name} has no physical address — DROPPED")
-            continue
+            print(f"[SMB_MAPS] {company_name} has no address — keeping anyway (will enrich from website)")
 
         domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
 
@@ -323,15 +317,23 @@ async def run_smb_maps(
             "linkedin": enrichment.get("linkedin", "ABSENT"),
             "instagram": enrichment.get("instagram", "ABSENT"),
             "facebook": enrichment.get("facebook", "ABSENT"),
-            "phone": enrichment.get("phone", "ABSENT"),
+            "phone": enrichment.get("phone", "ABSENT") if enrichment.get("phone", "ABSENT") != "ABSENT" else phone,
             "address": address,
             "validation_gates_passed": gates_passed,
         }
 
-        # Pre-filter: Footprint check
+        # Pre-filter: Footprint check (relaxed — a business with just a
+        # website or company name is still useful, don't drop it)
         if not check_footprint(lead):
-            print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
-            continue
+            # If enrichment gave us nothing, try using the phone from DeepSeek
+            if phone and phone != "ABSENT":
+                lead["phone"] = phone
+                if not check_footprint(lead):
+                    print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
+                    continue
+            else:
+                print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
+                continue
 
         # Gate 2: SMTP (Starter+)
         if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
