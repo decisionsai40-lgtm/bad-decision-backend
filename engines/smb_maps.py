@@ -26,6 +26,7 @@ from scraping.stealth_fetcher import (
     extract_text_from_html,
     build_opencorporates_url,
 )
+from scraping.email_scraper import enrich_lead_with_email
 from scraping.osm_search import search_local_businesses
 from scraping.serper_search import serper_search
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
@@ -338,8 +339,9 @@ async def run_smb_maps(
                 continue
             gates_passed = 1
 
-        # Enrich with DeepSeek
-        enrichment = await _enrich_local_lead(company_name, website_url, address, user_tier)
+        # Enrich with email scraper (scrapes the website for real emails — much
+        # better than DeepSeek which often returns "ABSENT")
+        enrichment = await enrich_lead_with_email(company_name, website_url)
 
         lead = {
             "domain_hash": domain_hash,
