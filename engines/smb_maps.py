@@ -67,8 +67,8 @@ async def run_smb_maps(
 
     location_string = ", ".join([p for p in [state_region, country] if p]) if (state_region or country) else query
 
-    osm_task = search_local_businesses(query, location=location_string, limit=lead_target)
-    serper_task = serper_search(f"{search_query} local small business", num_results=20)
+    osm_task = search_local_businesses(query, location=location_string, radius=50000, limit=lead_target)
+    serper_task = serper_search(f"{search_query} local small business", num_results=50)
     oc_task = stealth_fetch(build_opencorporates_url(query), timeout=SOURCE_TIMEOUT)
 
     osm_businesses, serper_results, oc_result = await asyncio.gather(

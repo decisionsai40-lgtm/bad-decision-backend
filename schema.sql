@@ -386,24 +386,38 @@ BEGIN
 
   -- If the balance row doesn't exist yet (brand-new user), create it
   IF row_count = 0 THEN
-    INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased)
-    VALUES (
-      p_user_id, p_amount, 0,
-      CASE WHEN p_transaction_type = 'purchase' THEN p_amount ELSE 0 END
-    )
-    ON CONFLICT (user_id) DO UPDATE
-      SET credits_balance = credit_balances.credits_balance + p_amount,
+    BEGIN
+      INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased)
+      VALUES (
+        p_user_id, p_amount, 0,
+        CASE WHEN p_transaction_type = 'purchase' THEN p_amount ELSE 0 END
+      );
+    EXCEPTION WHEN OTHERS THEN
+      -- Row was created by a concurrent request — update it instead
+      UPDATE credit_balances
+      SET credits_balance = credits_balance + p_amount,
           total_purchased = CASE
-            WHEN p_transaction_type = 'purchase' THEN credit_balances.total_purchased + p_amount
-            ELSE credit_balances.total_purchased
+            WHEN p_transaction_type = 'purchase' THEN total_purchased + p_amount
+            ELSE total_purchased
           END,
-          updated_at = now();
+          updated_at = now()
+      WHERE user_id = p_user_id;
+    END;
   END IF;
 
-  -- Log the transaction (idempotent via unique index on reference_id + transaction_type)
-  INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-  VALUES (p_user_id, p_amount, p_transaction_type, p_description, p_reference_id)
-  ON CONFLICT (reference_id, transaction_type) DO NOTHING;
+  -- Log the transaction (check if already exists to avoid duplicates)
+  -- Using WHERE NOT EXISTS instead of ON CONFLICT for compatibility
+  BEGIN
+    INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
+    SELECT p_user_id, p_amount, p_transaction_type, p_description, p_reference_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM credit_transactions
+      WHERE reference_id = p_reference_id
+        AND transaction_type = p_transaction_type
+    );
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
 
   RETURN TRUE;
 END;

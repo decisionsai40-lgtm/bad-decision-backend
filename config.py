@@ -82,10 +82,9 @@ CREDIT_COST_SMTP = 3       # Pro: Gate 1 + 2 + 3 (DNS + SMTP + DeepSeek) — 3 c
 CREDIT_FREE_TRIAL = 50     # Credits given to new free users
 
 # Lead targets (tuned for Render FREE tier — 512MB RAM)
-# Free Render tier cannot handle 50-100 leads with concurrency.
-# These targets give good volume without crashing.
-LEAD_TARGET_FREE = 15      # Free tier: up to 15 leads per search
-LEAD_TARGET_PAID = 30      # Paid tiers: up to 30 leads per search
+# Increased to return more leads per search.
+LEAD_TARGET_FREE = 50      # Free tier: up to 50 leads per search
+LEAD_TARGET_PAID = 100     # Paid tiers: up to 100 leads per search
 
 
 # ============================================================
