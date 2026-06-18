@@ -1,7 +1,23 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-python-dotenv==1.0.1
-httpx==0.27.2
-supabase==2.7.4
-scrapling[fetchers]==0.4.8
-dnspython==2.6.1
+# ============================================================
+# BAD DECISION — Backend Dependencies
+# ============================================================
+# All packages pinned to exact versions per the handoff brief.
+
+fastapi==0.115.0          # Web framework (API server)
+uvicorn==0.30.6           # ASGI server (runs the FastAPI app)
+python-dotenv==1.0.1      # Loads .env file in local dev
+httpx==0.27.2             # Async HTTP client (used by Serper.dev + OpenStreetMap + DeepSeek)
+supabase==2.7.4           # Supabase Python SDK (database client)
+scrapling[fetchers]==0.4.8 # Stealth web scraping (curl_cffi backend, Chrome TLS impersonation)
+dnspython==2.6.1          # DNS lookups for Gate 1 (domain + MX record checks)
+
+# ============================================================
+# NOTES
+# ============================================================
+# Serper.dev (Google Search API) and OpenStreetMap (Nominatim + Overpass)
+# do NOT need extra packages — they use httpx (already listed above).
+#
+# Rate limiting is in-memory (no Redis needed). For production at scale,
+# add `redis==5.0.0` and switch the rate limiter to use it.
+#
+# SMTP verification (Gate 2) uses Python's built-in `smtplib` — no extra package.

@@ -1,6 +1,6 @@
 """
-BAD DECISION AI — Stealth Web Fetcher (Scrapling-First)
-========================================================
+BAD DECISION — Stealth Web Fetcher (Scrapling)
+===============================================
 Uses Scrapling's Fetcher mode (curl_cffi backend) to fetch web pages
 with Chrome TLS fingerprint impersonation.
 
@@ -15,13 +15,17 @@ WHAT THIS DOES NOT BYPASS (would need StealthyFetcher + browser):
   - Sites requiring JavaScript execution
 
 NO browser or Playwright required — works on Render free tier.
+
+NOTE: This module is now used ONLY for static HTML pages (Meta Ads Library,
+Yelp, Houzz, Reddit, GitHub, OpenCorporates, company websites). All Google
+search queries go through Serper.dev (see scraping/serper_search.py) and all
+local business queries go through OpenStreetMap (see scraping/osm_search.py).
 """
 
 from scrapling import Fetcher
 from typing import Optional, Dict, Any, List
-from urllib.parse import quote_plus, urlencode, urlparse, urljoin
+from urllib.parse import quote_plus, urlencode, urljoin
 import re
-import json
 
 # Create a reusable Fetcher instance
 _fetcher = Fetcher()
@@ -29,7 +33,7 @@ _fetcher = Fetcher()
 
 async def stealth_fetch(
     url: str,
-    timeout: int = 30,
+    timeout: int = 15,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch a webpage using Scrapling's Fetcher (curl_cffi based).
@@ -37,7 +41,7 @@ async def stealth_fetch(
 
     Args:
         url: The webpage to fetch
-        timeout: How many seconds to wait before giving up
+        timeout: How many seconds to wait before giving up (default 15)
 
     Returns:
         Dictionary with page content and status, or None if failed
@@ -61,21 +65,6 @@ async def stealth_fetch(
         print(f"[STEALTH] Fetch error for {url}: {e}")
 
     return None
-
-
-def extract_with_adaptive_css(page, selector: str) -> list:
-    """
-    Use Scrapling's adaptive CSS extraction to find elements
-    even when the website structure changes.
-    """
-    if page is None:
-        return []
-    try:
-        elements = page.css(selector)
-        return elements
-    except Exception as e:
-        print(f"[STEALTH] CSS extraction error: {e}")
-        return []
 
 
 def extract_text_from_html(html: str, max_chars: int = 15000) -> str:
@@ -119,21 +108,11 @@ def extract_links_from_html(html: str, base_url: str = "") -> List[str]:
 
 # ============================================================
 # PLATFORM-SPECIFIC URL BUILDERS
-# These construct the exact URLs Scrapling will fetch
+# These construct the exact URLs Scrapling will fetch.
+# Google Search and Google Maps URL builders have been REMOVED —
+# use Serper.dev (scraping/serper_search.py) and OpenStreetMap
+# (scraping/osm_search.py) instead.
 # ============================================================
-
-def build_google_search_url(query: str, num_results: int = 25) -> str:
-    """Build a Google search URL for finding businesses."""
-    q = quote_plus(f"{query} business")
-    return f"https://www.google.com/search?q={q}&num={num_results}&hl=en"
-
-
-def build_google_maps_url(query: str, location: str = "") -> str:
-    """Build a Google Maps search URL for finding local businesses."""
-    search_term = f"{query} {location}".strip() if location else query
-    q = quote_plus(search_term)
-    return f"https://www.google.com/maps/search/{q}"
-
 
 def build_meta_ads_library_url(query: str) -> str:
     """Build a Meta Ads Library search URL."""
@@ -153,12 +132,6 @@ def build_houzz_search_url(query: str) -> str:
     """Build a Houzz search URL."""
     q = quote_plus(query)
     return f"https://www.houzz.com/professionals/searchQuery?q={q}"
-
-
-def build_linkedin_search_url(query: str) -> str:
-    """Build a LinkedIn public search URL."""
-    q = quote_plus(query)
-    return f"https://www.linkedin.com/search/results/content/?keywords={q}"
 
 
 def build_github_search_url(query: str) -> str:

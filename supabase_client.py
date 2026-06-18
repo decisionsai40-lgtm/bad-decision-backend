@@ -1,7 +1,9 @@
 """
-BAD DECISION AI — Supabase Database Connection
-===============================================
+BAD DECISION — Supabase Database Connection
+============================================
 Connects to the Supabase database using the SERVICE ROLE key (full access).
+This bypasses RLS (Row Level Security) so the backend can read/write any
+user's data. RLS policies protect the anon key (used by the browser).
 
 Lazy singleton: client created on first call.
 Does NOT crash at import time if env vars are missing.
@@ -16,6 +18,9 @@ _supabase_client: Client | None = None
 def get_supabase() -> Client:
     """
     Returns the Supabase client (lazy singleton).
+
+    The client is created on the first call and reused for all subsequent calls.
+    If SUPABASE_URL or SUPABASE_KEY are not set, raises RuntimeError.
 
     Example:
         from supabase_client import get_supabase

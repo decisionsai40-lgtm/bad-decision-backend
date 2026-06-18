@@ -1,15 +1,18 @@
 """
-BAD DECISION AI — Gate 2: Footprint Check
-==========================================
-This is the MEDIUM-speed check. We verify that the lead
-has at least ONE way to contact them — a phone number,
-an email, a LinkedIn profile, or an Instagram page.
+BAD DECISION — Footprint Check (Pre-filter)
+============================================
+This is a FAST pre-filter check. We verify that the lead has at least
+ONE way to contact them — a phone number, an email, a LinkedIn profile,
+an Instagram page, or at least a decision maker name.
 
-If a lead has ZERO contact methods, there's no point
-keeping it — nobody can reach them.
+If a lead has ZERO contact methods, there's no point keeping it —
+nobody can reach them. We drop it before running the expensive
+validation gates (DNS, SMTP, DeepSeek).
 
 Speed: Fast (regex check, < 1 second)
-Who gets it: Starter, Growth, Pro (NOT Free tier)
+Who gets it: ALL tiers (this is a pre-filter, not a paid-gate.
+The 3 validation gates are: Gate 1 = DNS, Gate 2 = SMTP, Gate 3 = DeepSeek.
+This footprint check runs BEFORE the gates to save compute.)
 """
 
 import re
@@ -19,10 +22,6 @@ from typing import Dict, Any
 def check_footprint(lead: Dict[str, Any]) -> bool:
     """
     Check if a lead has at least ONE viable contact method.
-
-    Think of it like: "Can we actually reach this person?"
-    If they have no email, no phone, no LinkedIn, no Instagram...
-    then this lead is useless.
 
     Args:
         lead: The lead dictionary with all its data
@@ -59,7 +58,7 @@ def check_footprint(lead: Dict[str, Any]) -> bool:
         contact_found = True
 
     if not contact_found:
-        print(f"[GATE2-FOOTPRINT] {lead.get('company_name', 'Unknown')} — No contact method found")
+        print(f"[FOOTPRINT] {lead.get('company_name', 'Unknown')} — No contact method found, dropping")
 
     return contact_found
 
