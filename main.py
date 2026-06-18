@@ -53,10 +53,11 @@ app.add_middleware(
 # ============================================================
 # TIER CONFIG — which engines each tier can use
 # ============================================================
-# Per the brief: free tier gets ads_intent ONLY.
-# Starter, Growth, Pro get all 4 engines.
+# Free tier gets smb_maps (Local Businesses) — uses OpenStreetMap which
+# returns real structured data and tends to find more leads.
+# ads_intent is now a PAID feature (requires Starter+).
 TIER_ENGINES = {
-    "free":    ["ads_intent"],
+    "free":    ["smb_maps"],
     "starter": ["ads_intent", "smb_maps", "web_absent", "social_intent"],
     "growth":  ["ads_intent", "smb_maps", "web_absent", "social_intent"],
     "pro":     ["ads_intent", "smb_maps", "web_absent", "social_intent"],

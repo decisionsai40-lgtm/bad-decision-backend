@@ -44,7 +44,8 @@ async def serper_search(
         return []
 
     # Determine endpoint based on search type
-    endpoint = f"{SERPER_BASE_URL}/{search_type}" if search_type != "search" else SERPER_BASE_URL
+    # Serper API requires the /search suffix for web search
+    endpoint = f"{SERPER_BASE_URL}/{search_type}"
 
     payload: Dict[str, Any] = {
         "q": query,
