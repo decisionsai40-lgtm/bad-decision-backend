@@ -257,18 +257,30 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         if ledger_result.data and len(ledger_result.data) > 0:
             balance = ledger_result.data[0].get("credits_balance", 0)
         else:
-            # No credit_balances row — create one with 0 balance
-            print(f"[API] No credit_balances row for user {req.user_id} — auto-creating with 0 balance")
+            # No credit_balances row — the handle_new_user RPC above should have
+            # created it with 50 free credits. If it didn't (RPC failed), try
+            # creating credit_balances directly with 50 credits (matching the
+            # signup bonus). This prevents the race condition where the backend
+            # creates a 0-credit row before the frontend can create a 50-credit row.
+            print(f"[API] No credit_balances row for user {req.user_id} — creating with 50 free credits")
             try:
                 db.table("credit_balances").insert({
                     "user_id": req.user_id,
-                    "credits_balance": 0,
+                    "credits_balance": 50,
                     "credits_reserved": 0,
-                    "total_purchased": 0,
+                    "total_purchased": 50,
+                }).execute()
+                # Also log the signup bonus transaction
+                db.table("credit_transactions").insert({
+                    "user_id": req.user_id,
+                    "amount": 50,
+                    "transaction_type": "signup_bonus",
+                    "description": "50 free credits for signing up",
+                    "reference_id": f"signup_{req.user_id}",
                 }).execute()
             except Exception as insert_err:
                 print(f"[API] Could not auto-create credit_balances: {insert_err}")
-            balance = 0
+            balance = 50  # Assume 50 if we just created it
 
         if balance < req.credits_reserved:
             raise HTTPException(
