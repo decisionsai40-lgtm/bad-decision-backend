@@ -639,6 +639,83 @@ async def get_user_settings(user_id: str, x_api_secret: Optional[str] = Header(N
 
 
 # ============================================================
+# ON-DEMAND OUTREACH MESSAGE GENERATION
+# ============================================================
+class OutreachRequest(BaseModel):
+    lead_id: str = Field(..., min_length=1, max_length=256)
+
+
+@app.post("/api/outreach/generate")
+async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = Header(None)):
+    """
+    Generate personalized outreach messages for a single lead on demand.
+    The user clicks 'Generate Messages' on a lead card, and this endpoint
+    fetches the lead, fetches the user's settings, generates 3 messages,
+    saves them to the database, and returns them.
+    """
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    from ai.outreach_generator import generate_outreach_messages
+    db = get_supabase()
+
+    # 1. Fetch the lead
+    lead_result = (
+        db.table("workspace_leads")
+        .select("*")
+        .eq("id", req.lead_id)
+        .limit(1)
+        .execute()
+    )
+    if not lead_result.data:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead = lead_result.data[0]
+    user_id = lead.get("user_id")
+
+    # 2. Fetch the user's settings
+    profile_result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_result.data or not profile_result.data[0].get("user_service"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please set up your service in Settings first."
+        )
+
+    user_settings = profile_result.data[0]
+    user_service = user_settings.get("user_service", "")
+    target_audience = user_settings.get("target_audience", "")
+    copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+
+    # 3. Generate the outreach messages
+    try:
+        outreach = await generate_outreach_messages(
+            lead, user_service, target_audience, copywriting_style
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate messages: {str(e)}")
+
+    # 4. Save the messages to the database
+    db.table("workspace_leads").update({
+        "outreach_email": outreach.get("email_message", "ABSENT"),
+        "outreach_social": outreach.get("social_message", "ABSENT"),
+        "outreach_call": outreach.get("call_script", "ABSENT"),
+    }).eq("id", req.lead_id).execute()
+
+    return {
+        "success": True,
+        "outreach_email": outreach.get("email_message", "ABSENT"),
+        "outreach_social": outreach.get("social_message", "ABSENT"),
+        "outreach_call": outreach.get("call_script", "ABSENT"),
+    }
+
+
+# ============================================================
 # COLLECTIONS ENDPOINT
 # ============================================================
 @app.get("/api/collections/{user_id}")
