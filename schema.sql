@@ -47,6 +47,9 @@ CREATE TABLE profiles (
   full_name     TEXT,
   tier          TEXT NOT NULL DEFAULT 'free' CHECK (tier IN ('free','starter','growth','pro')),
   country       TEXT DEFAULT 'US',
+  user_service       TEXT,
+  target_audience    TEXT,
+  copywriting_style  TEXT DEFAULT 'david_ogilvy',
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -194,6 +197,9 @@ CREATE TABLE workspace_leads (
   platform                  TEXT,
   intent_text               TEXT,
   validation_gates_passed   INTEGER DEFAULT 0,
+  outreach_email     TEXT,
+  outreach_social    TEXT,
+  outreach_call      TEXT,
   created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

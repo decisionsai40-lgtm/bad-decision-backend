@@ -15,6 +15,7 @@ from config import (
 )
 from engines import ENGINE_MAP
 from dedup.hash_dedup import save_query_cache, compute_query_hash
+from ai.outreach_generator import generate_outreach_messages
 
 
 # ============================================================
@@ -142,8 +143,47 @@ async def _process_task(task: Dict[str, Any]):
             await _update_task_status(task_id, "exhausted")
             return
 
-        # Step 4: Save leads
-        await _update_task(task_id, progress=85, current_step=f"Saving {len(leads)} leads to your workspace...")
+        # Step 4: Fetch user settings for outreach messages
+        user_service = ""
+        target_audience = ""
+        copywriting_style = "david_ogilvy"
+        try:
+            db = get_supabase()
+            profile_result = db.table("profiles").select("user_service, target_audience, copywriting_style").eq("id", user_id).limit(1).execute()
+            if profile_result.data and len(profile_result.data) > 0:
+                user_service = profile_result.data[0].get("user_service", "") or ""
+                target_audience = profile_result.data[0].get("target_audience", "") or ""
+                copywriting_style = profile_result.data[0].get("copywriting_style", "david_ogilvy") or "david_ogilvy"
+        except Exception as e:
+            print(f"[WORKER] Could not fetch user settings: {e}")
+
+        # Step 5: Generate outreach messages for each lead (if user has set their service)
+        if user_service and user_service.strip():
+            await _update_task(task_id, progress=80, current_step="Writing personalized outreach messages...")
+            print(f"[WORKER] Generating outreach messages for {len(leads)} leads (style: {copywriting_style})")
+
+            for lead in leads:
+                try:
+                    outreach = await generate_outreach_messages(
+                        lead, user_service, target_audience, copywriting_style
+                    )
+                    lead["outreach_email"] = outreach.get("email_message", "ABSENT")
+                    lead["outreach_social"] = outreach.get("social_message", "ABSENT")
+                    lead["outreach_call"] = outreach.get("call_script", "ABSENT")
+                except Exception as e:
+                    print(f"[WORKER] Outreach generation error for lead: {e}")
+                    lead["outreach_email"] = "ABSENT"
+                    lead["outreach_social"] = "ABSENT"
+                    lead["outreach_call"] = "ABSENT"
+        else:
+            # User hasn't set up their service yet — skip outreach
+            for lead in leads:
+                lead["outreach_email"] = "ABSENT"
+                lead["outreach_social"] = "ABSENT"
+                lead["outreach_call"] = "ABSENT"
+
+        # Step 6: Save leads
+        await _update_task(task_id, progress=90, current_step=f"Saving {len(leads)} leads to your workspace...")
         saved_count = await _save_leads(task_id, user_id, leads)
 
         # Step 5: Create collection
@@ -241,6 +281,10 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
             "intent_level": lead.get("intent_level"),
             "post_url": lead.get("post_url"),
             "author_username": lead.get("author_username"),
+            # Outreach messages
+            "outreach_email": lead.get("outreach_email"),
+            "outreach_social": lead.get("outreach_social"),
+            "outreach_call": lead.get("outreach_call"),
         }
 
         # Remove None values

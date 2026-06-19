@@ -593,6 +593,52 @@ async def get_user_profile(
 
 
 # ============================================================
+# USER SETTINGS ENDPOINT (for outreach message personalization)
+# ============================================================
+class UpdateSettingsRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=256)
+    user_service: str = Field(default="", max_length=500)
+    target_audience: str = Field(default="", max_length=500)
+    copywriting_style: str = Field(default="david_ogilvy", pattern=r"^(dan_kennedy|donald_miller|ray_edwards|david_ogilvy|jay_abraham|gary_halbert)$")
+
+
+@app.put("/api/settings/{user_id}")
+async def update_user_settings(user_id: str, req: UpdateSettingsRequest, x_api_secret: Optional[str] = Header(None)):
+    """Update user settings (service, audience, copywriting style) for outreach messages."""
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = db.table("profiles").update({
+        "user_service": req.user_service,
+        "target_audience": req.target_audience,
+        "copywriting_style": req.copywriting_style,
+        "updated_at": "now()",
+    }).eq("id", user_id).execute()
+
+    return {"success": True, "settings": result.data[0] if result.data else None}
+
+
+@app.get("/api/settings/{user_id}")
+async def get_user_settings(user_id: str, x_api_secret: Optional[str] = Header(None)):
+    """Get user settings for outreach messages."""
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return {"settings": {"user_service": "", "target_audience": "", "copywriting_style": "david_ogilvy"}}
+    return {"settings": result.data[0]}
+
+
+# ============================================================
 # COLLECTIONS ENDPOINT
 # ============================================================
 @app.get("/api/collections/{user_id}")
