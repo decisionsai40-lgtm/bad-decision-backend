@@ -73,7 +73,7 @@ OSM_OVERPASS_ENDPOINT = os.getenv("OSM_OVERPASS_ENDPOINT", "https://overpass-api
 CREDIT_COST_SCAN = 1       # Free tier: 1 credit per lead
 CREDIT_COST_DEEP = 2       # Starter/Growth: 2 credits per lead
 CREDIT_COST_SMTP = 3       # Pro: 3 credits per lead
-CREDIT_FREE_TRIAL = 50
+CREDIT_FREE_TRIAL = 100
 
 # Lead targets — credit-aware (engine will check user balance)
 LEAD_TARGET_FREE = 50      # Free tier cap

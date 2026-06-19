@@ -77,7 +77,7 @@ async def run_web_absent(
     # PHASE 1: 10x Serper web searches + ScrapingAnt for Yelp/Houzz (CONCURRENT)
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(15, "Searching Yelp, Houzz, Etsy, and Facebook for businesses without websites...")
+        await progress_callback(15, "Searching directories for businesses that need a website...")
 
     web_queries = build_web_absent_queries(query, location)
     web_tasks = [serper_search(q, num_results=10) for q in web_queries]
@@ -184,7 +184,7 @@ async def run_web_absent(
         # Cap at 3 profile fetches to conserve ScrapingAnt credits
         deep_fetch_urls = aggregator_profile_urls[:3]
         if progress_callback:
-            await progress_callback(25, f"Rendering {len(deep_fetch_urls)} aggregator profile pages with ScrapingAnt...")
+            await progress_callback(25, f"Reading business profiles...")
 
         print(f"[WEB_ABSENT] ScrapingAnt deep-fetch on {len(deep_fetch_urls)} profile URLs")
         deep_tasks = [scrape_with_js(u) for u in deep_fetch_urls]
@@ -218,7 +218,7 @@ async def run_web_absent(
     # PHASE 2: DeepSeek — Structure the scraped data
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(35, "AI is analyzing aggregator data and finding businesses without websites...")
+        await progress_callback(35, "Finding businesses that need a website...")
 
     print(f"[WEB_ABSENT] DeepSeek structuring phase")
 
@@ -292,7 +292,7 @@ async def run_web_absent(
     # PHASE 3: FILTER, VALIDATE & ENRICH
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(50, f"Filtering and enriching {min(len(businesses), lead_target)} businesses...")
+        await progress_callback(50, f"Verifying {min(len(businesses), lead_target)} businesses...")
 
     for biz in businesses[:lead_target]:
         if len(leads) >= lead_target:
@@ -308,6 +308,39 @@ async def run_web_absent(
 
         if not company_name or company_name == "ABSENT":
             continue
+
+        # HARD FILTER: Block aggregator platform names from being treated as businesses
+        # (DeepSeek sometimes extracts "Yelp", "Houzz", "Facebook" etc. as businesses)
+        PLATFORM_NAMES = {
+            "yelp", "houzz", "etsy", "facebook", "instagram", "google",
+            "google maps", "thumbtack", "angi", "bark", "nextdoor",
+            "linkedin", "twitter", "reddit", "youtube", "tiktok",
+            "tripadvisor", "yellow pages", "opencorporates",
+            "yelp.com", "houzz.com", "etsy.com", "facebook.com",
+            "instagram.com", "google.com", "thumbtack.com", "angi.com",
+            "bark.com", "nextdoor.com", "linkedin.com", "twitter.com",
+            "reddit.com", "youtube.com", "tiktok.com", "tripadvisor.com",
+        }
+        if company_name.lower().strip() in PLATFORM_NAMES:
+            print(f"[WEB_ABSENT] '{company_name}' is a platform, not a business — DROPPED")
+            continue
+
+        # HARD FILTER: Block aggregator URLs that are just the platform homepage
+        # (e.g., yelp.com, houzz.com — not yelp.com/biz/specific-business)
+        if aggregator_url != "ABSENT" and aggregator_url != "":
+            from urllib.parse import urlparse
+            try:
+                parsed_url = urlparse(aggregator_url if aggregator_url.startswith("http") else f"https://{aggregator_url}")
+                domain = (parsed_url.hostname or "").lower().replace("www.", "")
+                path = (parsed_url.path or "").strip("/")
+                # If the URL is just the domain with no path, it's a homepage, not a business profile
+                if not path and domain in {"yelp.com", "houzz.com", "etsy.com", "facebook.com",
+                                           "instagram.com", "google.com", "thumbtack.com", "angi.com",
+                                           "bark.com", "nextdoor.com", "linkedin.com", "tripadvisor.com"}:
+                    print(f"[WEB_ABSENT] '{company_name}' URL is platform homepage — DROPPED")
+                    continue
+            except:
+                pass
 
         # HARD FILTER: Must NOT have an external website
         if has_external_website is True or str(has_external_website).lower() == "true":

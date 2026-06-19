@@ -64,7 +64,7 @@ async def run_ads_intent(
     # PHASE 1: 10x Serper web searches + Meta Ads Library (CONCURRENT)
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(15, "Searching Google and Meta Ads Library for businesses running ads...")
+        await progress_callback(15, "Searching for businesses running ads...")
 
     web_queries = build_ads_intent_queries(query, location)
     web_tasks = [serper_search(q, num_results=10) for q in web_queries]
@@ -132,7 +132,7 @@ async def run_ads_intent(
     # PHASE 2: DeepSeek — Structure the combined text
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(35, "AI is analyzing scraped data and extracting businesses running ads...")
+        await progress_callback(35, "Finding businesses that spend on ads...")
 
     print(f"[ADS_INTENT] DeepSeek structuring phase")
 

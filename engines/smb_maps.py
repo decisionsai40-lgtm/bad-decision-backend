@@ -73,7 +73,7 @@ async def run_smb_maps(
     # PHASE 1: Serper maps + 10x Serper web searches (CONCURRENT)
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(15, f"Searching Google Maps and web for local businesses in {location or 'your area'}...")
+        await progress_callback(15, f"Searching for local businesses in {location or 'your area'}...")
 
     web_queries = build_smb_maps_queries(query, location)
 
@@ -152,7 +152,7 @@ async def run_smb_maps(
     scraped_texts: List[Dict[str, str]] = []
     if yelp_urls and SCRAPINGANT_API_KEY:
         if progress_callback:
-            await progress_callback(25, f"Rendering {min(len(yelp_urls), 3)} Yelp pages with ScrapingAnt...")
+            await progress_callback(25, f"Reading business directory pages...")
 
         # Cap to 3 Yelp pages to conserve ScrapingAnt credits
         yelp_fetch_tasks = [scrape_with_js(u) for u in yelp_urls[:3]]
@@ -182,7 +182,7 @@ async def run_smb_maps(
     total_so_far = len(maps_leads)
     if total_so_far < lead_target:
         if progress_callback:
-            await progress_callback(30, "Falling back to OpenStreetMap for more local businesses...")
+            await progress_callback(30, "Searching for more local businesses...")
 
         print(f"[SMB_MAPS] Only {total_so_far}/{lead_target} so far — trying OSM fallback")
         try:
@@ -237,7 +237,7 @@ async def run_smb_maps(
     structured_businesses: List[Dict[str, Any]] = []
     if scraped_texts and len(leads) + len(maps_leads) < lead_target:
         if progress_callback:
-            await progress_callback(40, "AI is analyzing search results and extracting businesses...")
+            await progress_callback(40, "Finding businesses in your area...")
 
         combined_text = "\n\n".join(
             f"--- SOURCE: {s['source']} ---\n{s['content']}"
@@ -307,7 +307,7 @@ async def run_smb_maps(
     # PHASE 4: Validate & enrich maps_leads (already structured)
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(50, f"Validating {len(maps_leads)} structured businesses from Serper Maps/OSM...")
+        await progress_callback(50, f"Verifying businesses...")
 
     # Process maps leads first (they have the richest structured data)
     for biz in maps_leads:
@@ -410,7 +410,7 @@ async def run_smb_maps(
     # --------------------------------------------------------
     if structured_businesses and len(leads) < lead_target:
         if progress_callback:
-            await progress_callback(70, f"Validating {min(len(structured_businesses), lead_target - len(leads))} more businesses from web search...")
+            await progress_callback(70, f"Verifying more businesses...")
 
         for biz in structured_businesses:
             if len(leads) >= lead_target:

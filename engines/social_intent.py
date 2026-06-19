@@ -75,7 +75,7 @@ async def run_social_intent(
     # PHASE 1: 10x Serper web searches + Reddit via ScrapingAnt (CONCURRENT)
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(15, "Searching Reddit, Twitter, Facebook, and LinkedIn for buying intent posts...")
+        await progress_callback(15, "Searching social media for people who need your help...")
 
     web_queries = build_social_intent_queries(query, location)
     web_tasks = [serper_search(q, num_results=10) for q in web_queries]
@@ -142,7 +142,7 @@ async def run_social_intent(
     if SCRAPINGANT_API_KEY and reddit_profile_urls and len(leads) < lead_target:
         deep_fetch_urls = reddit_profile_urls[:3]
         if progress_callback:
-            await progress_callback(25, f"Rendering {len(deep_fetch_urls)} Reddit posts with ScrapingAnt...")
+            await progress_callback(25, f"Reading social media posts...")
 
         print(f"[SOCIAL_INTENT] ScrapingAnt deep-fetch on {len(deep_fetch_urls)} Reddit URLs")
         deep_tasks = [scrape_with_js(u) for u in deep_fetch_urls]
@@ -171,7 +171,7 @@ async def run_social_intent(
     # PHASE 2: DeepSeek — Structure the scraped data
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(40, "AI is analyzing posts and extracting people with buying intent...")
+        await progress_callback(40, "Finding people ready to buy...")
 
     print(f"[SOCIAL_INTENT] DeepSeek structuring phase")
 
@@ -274,36 +274,25 @@ async def run_social_intent(
         # Determine LinkedIn URL if platform is LinkedIn
         linkedin_url = post_url if (platform.lower() == "linkedin" and post_url != "ABSENT") else "ABSENT"
 
-        # Email scraper enrichment — even social posts sometimes link to personal
-        # sites/profiles where an email can be scraped. The function gracefully
-        # returns ABSENT when there's nothing to find.
-        try:
-            enrichment = await enrich_lead_with_email(name, post_url if post_url != "ABSENT" else "ABSENT")
-        except Exception as e:
-            print(f"[SOCIAL_INTENT] Email scraper error for {name}: {e}")
-            enrichment = {
-                "verified_email": "ABSENT", "phone": "ABSENT",
-                "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
-            }
-
-        # If email scraper found a LinkedIn URL and we don't already have one, use it
-        if linkedin_url == "ABSENT" and enrichment.get("linkedin", "ABSENT") != "ABSENT":
-            linkedin_url = enrichment.get("linkedin")
+        # Social intent leads do NOT have company websites to scrape.
+        # They are PEOPLE posting on social media, not businesses.
+        # Do NOT run the email scraper on platform URLs (twitter.com, reddit.com, etc.)
+        # That was a bug — it was treating the social platforms as businesses.
 
         # Social intent leads do NOT go through DNS/SMTP/DeepSeek gates —
         # these are real-time social posts, there's no website to validate.
         lead = {
             "domain_hash": domain_hash,
-            "company_name": name,  # Use the person's name as the lead identifier
-            "website_url": post_url if post_url != "ABSENT" else "ABSENT",
+            "company_name": name,
+            "website_url": "ABSENT",  # Social leads don't have websites
             "dm_name": name,
             "dm_position": "ABSENT",
-            "verified_email": enrichment.get("verified_email", "ABSENT"),
+            "verified_email": "ABSENT",  # Social leads don't have emails
             "is_catchall": False,
             "linkedin": linkedin_url,
-            "instagram": enrichment.get("instagram", "ABSENT"),
-            "facebook": enrichment.get("facebook", "ABSENT"),
-            "phone": enrichment.get("phone", "ABSENT"),
+            "instagram": "ABSENT",
+            "facebook": "ABSENT",
+            "phone": "ABSENT",
             "platform": platform,
             "intent_text": intent_text,
             "post_url": post_url,

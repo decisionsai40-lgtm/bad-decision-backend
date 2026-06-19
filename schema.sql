@@ -205,7 +205,7 @@ CREATE INDEX idx_leads_domain  ON workspace_leads (domain_hash);
 -- 8. RPC: handle_new_user
 -- ============================================================
 -- Called by the Clerk webhook when a new user signs up.
--- Creates the profile row, the credit_balances row with 50 free credits,
+-- Creates the profile row, the credit_balances row with 100 free credits,
 -- and logs a signup_bonus transaction.
 CREATE OR REPLACE FUNCTION handle_new_user(
   p_clerk_id  TEXT,
@@ -218,13 +218,13 @@ BEGIN
   VALUES (p_clerk_id, p_email, p_full_name, 'free', COALESCE(NULLIF(p_country, ''), 'US'))
   ON CONFLICT (id) DO NOTHING;
 
-  -- Insert credit_balances with 50 free credits + 1 month expiry
+  -- Insert credit_balances with 100 free credits + 1 month expiry
   INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased, credits_expiry, last_renewed_at)
-  VALUES (p_clerk_id, 50, 0, 50, now() + interval '30 days', now())
+  VALUES (p_clerk_id, 100, 0, 50, now() + interval '30 days', now())
   ON CONFLICT (user_id) DO NOTHING;
 
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-  SELECT p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id
+  SELECT p_clerk_id, 100, 'signup_bonus', '100 free credits for signing up', 'signup_' || p_clerk_id
   WHERE NOT EXISTS (
     SELECT 1 FROM credit_transactions
     WHERE reference_id = 'signup_' || p_clerk_id
@@ -468,7 +468,7 @@ BEGIN
       WHERE user_id = p_user_id;
 
       INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-      SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+      SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
       WHERE NOT EXISTS (
         SELECT 1 FROM credit_transactions
         WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
@@ -488,7 +488,7 @@ BEGIN
     WHERE user_id = p_user_id;
 
     INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-    SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+    SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
     WHERE NOT EXISTS (
       SELECT 1 FROM credit_transactions
       WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
@@ -606,7 +606,7 @@ CREATE TRIGGER trg_tasks_updated
 -- ============================================================
 -- After running this schema:
 --   1. The Clerk webhook calls handle_new_user() to create a profile +
---      credit_balances (50 free credits) + credit_transactions (signup_bonus).
+--      credit_balances (100 free credits) + credit_transactions (signup_bonus).
 --   2. When a user searches, the backend calls reserve_credits() to lock credits.
 --   3. The worker runs the engine. On success it calls commit_credits() for the
 --      actual spend and refund_credits() for any unused reserved amount.

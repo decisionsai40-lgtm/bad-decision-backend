@@ -26,11 +26,11 @@ BEGIN
   ON CONFLICT (id) DO NOTHING;
 
   INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased, credits_expiry, last_renewed_at)
-  VALUES (p_clerk_id, 50, 0, 50, now() + interval '30 days', now())
+  VALUES (p_clerk_id, 100, 0, 50, now() + interval '30 days', now())
   ON CONFLICT (user_id) DO NOTHING;
 
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-  SELECT p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id
+  SELECT p_clerk_id, 100, 'signup_bonus', '100 free credits for signing up', 'signup_' || p_clerk_id
   WHERE NOT EXISTS (
     SELECT 1 FROM credit_transactions
     WHERE reference_id = 'signup_' || p_clerk_id
@@ -111,18 +111,18 @@ BEGIN
     UPDATE credit_balances SET credits_balance = 0, credits_expiry = NULL, updated_at = now() WHERE user_id = p_user_id;
 
     IF tier_val = 'free' THEN
-      UPDATE credit_balances SET credits_balance = 50, credits_expiry = now() + interval '30 days', last_renewed_at = now(), updated_at = now() WHERE user_id = p_user_id;
+      UPDATE credit_balances SET credits_balance = 100, credits_expiry = now() + interval '30 days', last_renewed_at = now(), updated_at = now() WHERE user_id = p_user_id;
       INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-      SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+      SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
       WHERE NOT EXISTS (SELECT 1 FROM credit_transactions WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text);
     END IF;
     RETURN TRUE;
   END IF;
 
   IF tier_val = 'free' AND cb_record.last_renewed_at IS NOT NULL AND cb_record.last_renewed_at < now() - interval '30 days' THEN
-    UPDATE credit_balances SET credits_balance = 50, credits_expiry = now() + interval '30 days', last_renewed_at = now(), updated_at = now() WHERE user_id = p_user_id;
+    UPDATE credit_balances SET credits_balance = 100, credits_expiry = now() + interval '30 days', last_renewed_at = now(), updated_at = now() WHERE user_id = p_user_id;
     INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-    SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+    SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
     WHERE NOT EXISTS (SELECT 1 FROM credit_transactions WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text);
     RETURN TRUE;
   END IF;

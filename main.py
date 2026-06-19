@@ -280,7 +280,7 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
             try:
                 db.table("credit_balances").insert({
                     "user_id": req.user_id,
-                    "credits_balance": 50,
+                    "credits_balance": 100,
                     "credits_reserved": 0,
                     "total_purchased": 50,
                 }).execute()
