@@ -63,6 +63,8 @@ CREATE TABLE credit_balances (
   credits_balance   INTEGER NOT NULL DEFAULT 0 CHECK (credits_balance >= 0),
   credits_reserved  INTEGER NOT NULL DEFAULT 0 CHECK (credits_reserved >= 0),
   total_purchased   INTEGER NOT NULL DEFAULT 0 CHECK (total_purchased >= 0),
+  credits_expiry    TIMESTAMPTZ,  -- When credits expire (1 month from grant/purchase)
+  last_renewed_at   TIMESTAMPTZ DEFAULT now(),  -- When free credits were last renewed
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -212,18 +214,15 @@ CREATE OR REPLACE FUNCTION handle_new_user(
   p_country   TEXT
 ) RETURNS BOOLEAN AS $$
 BEGIN
-  -- Insert profile (idempotent: if exists, do nothing)
   INSERT INTO profiles (id, email, full_name, tier, country)
   VALUES (p_clerk_id, p_email, p_full_name, 'free', COALESCE(NULLIF(p_country, ''), 'US'))
   ON CONFLICT (id) DO NOTHING;
 
-  -- Insert credit_balances with 50 free credits (idempotent)
-  INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased)
-  VALUES (p_clerk_id, 50, 0, 50)
+  -- Insert credit_balances with 50 free credits + 1 month expiry
+  INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased, credits_expiry, last_renewed_at)
+  VALUES (p_clerk_id, 50, 0, 50, now() + interval '30 days', now())
   ON CONFLICT (user_id) DO NOTHING;
 
-  -- Log the signup bonus transaction (check if already exists to avoid duplicates)
-  -- Using WHERE NOT EXISTS instead of ON CONFLICT for compatibility
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
   SELECT p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id
   WHERE NOT EXISTS (
@@ -372,13 +371,14 @@ BEGIN
     END IF;
   END IF;
 
-  -- Add credits to balance
+  -- Add credits to balance + set expiry to 30 days from now
   UPDATE credit_balances
   SET credits_balance = credits_balance + p_amount,
       total_purchased = CASE
         WHEN p_transaction_type = 'purchase' THEN total_purchased + p_amount
         ELSE total_purchased
       END,
+      credits_expiry = now() + interval '30 days',
       updated_at = now()
   WHERE user_id = p_user_id;
 
@@ -420,6 +420,84 @@ BEGIN
   END;
 
   RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- 12b. RPC: renew_free_credits (monthly renewal + expiry check)
+-- ============================================================
+-- Called when a user fetches their credits. Checks if credits have expired
+-- (past credits_expiry date). If expired:
+--   - For free users: reset to 50 credits, set new expiry to 30 days from now
+--   - For paid users: reset to 0 (they need to buy more)
+-- If not expired: do nothing (credits are still valid).
+-- If last_renewed_at is more than 30 days ago for free users: renew 50 credits.
+CREATE OR REPLACE FUNCTION renew_free_credits(p_user_id TEXT) RETURNS BOOLEAN AS $$
+DECLARE
+  cb_record RECORD;
+  tier_val TEXT;
+BEGIN
+  SELECT cb.*, p.tier INTO cb_record
+  FROM credit_balances cb
+  JOIN profiles p ON p.id = cb.user_id
+  WHERE cb.user_id = p_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  tier_val := cb_record.tier;
+
+  -- Check if credits have expired
+  IF cb_record.credits_expiry IS NOT NULL AND cb_record.credits_expiry < now() THEN
+    -- Credits have expired. Reset balance to 0.
+    UPDATE credit_balances
+    SET credits_balance = 0,
+        credits_expiry = NULL,
+        updated_at = now()
+    WHERE user_id = p_user_id;
+
+    -- For free tier users, grant 50 new credits with 30-day expiry
+    IF tier_val = 'free' THEN
+      UPDATE credit_balances
+      SET credits_balance = 50,
+          credits_expiry = now() + interval '30 days',
+          last_renewed_at = now(),
+          updated_at = now()
+      WHERE user_id = p_user_id;
+
+      INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
+      SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+      WHERE NOT EXISTS (
+        SELECT 1 FROM credit_transactions
+        WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+      );
+    END IF;
+
+    RETURN TRUE;
+  END IF;
+
+  -- Check if free user hasn't been renewed in 30+ days (even if expiry is NULL)
+  IF tier_val = 'free' AND cb_record.last_renewed_at IS NOT NULL AND cb_record.last_renewed_at < now() - interval '30 days' THEN
+    UPDATE credit_balances
+    SET credits_balance = 50,
+        credits_expiry = now() + interval '30 days',
+        last_renewed_at = now(),
+        updated_at = now()
+    WHERE user_id = p_user_id;
+
+    INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
+    SELECT p_user_id, 50, 'signup_bonus', 'Monthly renewal: 50 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+    WHERE NOT EXISTS (
+      SELECT 1 FROM credit_transactions
+      WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+    );
+
+    RETURN TRUE;
+  END IF;
+
+  RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
 
