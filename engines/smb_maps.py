@@ -1,480 +1,542 @@
 """
-BAD DECISION — Engine 2: Local SMB Maps
-========================================
-This engine finds local brick-and-mortar businesses.
+BAD DECISION — Engine 1: smb_maps (Local Businesses)
+=====================================================
+This engine finds local brick-and-mortar businesses using:
+  1. Serper maps search (PRIMARY — structured data, fast)
+  2. 10x concurrent Serper web searches (build_smb_maps_queries)
+  3. OSM Overpass (FALLBACK ONLY — if Serper returns too few results)
+  4. ScrapingAnt for Yelp pages (if Serper found Yelp results)
 
 PIPELINE:
-  1. Fetch local business data from OSM (Overpass + Nominatim) + Serper.dev CONCURRENTLY
-     (OSM replaces Google Maps scraping — Google Maps requires JS and fails on Render free tier)
-  2. DeepSeek structures the data into clean lead objects
-  3. HARD FILTER: Drop any entity with > 50 employees or no physical address
-  4. Validation gates run based on tier:
-       - Free: Gate 1 (DNS)
-       - Starter/Growth: Gate 1 + Gate 2 (DNS + SMTP)
-       - Pro: Gate 1 + Gate 2 + Gate 3 (DNS + SMTP + DeepSeek)
+  1. Serper maps search (primary — structured data, bypasses DeepSeek structuring)
+  2. 10x Serper web searches concurrently (text results → DeepSeek structuring)
+  3. If total results < lead_target: try OSM as fallback
+  4. DeepSeek structures any remaining text results (NOT the maps results)
+  5. For each business:
+       Gate 1 (DNS)        — ALL tiers (if website exists)
+       Email scraper       — scrapes website for real emails
+       Footprint check     — drop leads with zero contact methods
+       Gate 2 (SMTP)       — Starter/Growth/Pro tiers
+       Gate 3 (DeepSeek)   — Pro tier only
 
-HARD RULE: Drop any entity with > 50 employees or lacking
-a physical address. We only want small businesses.
+UNIQUE FIELDS:
+  - rating         (float, 1-5)
+  - review_count   (int)
+  - category       (string — e.g., "Cafe", "Restaurant")
+  - address        (string)
+  - opening_hours  (string — from OSM if available)
 """
 
 import json
 import asyncio
 from typing import List, Dict, Any, Callable, Optional
 
-from scraping.stealth_fetcher import (
-    stealth_fetch,
-    extract_text_from_html,
-    build_opencorporates_url,
+from scraping.serper_search import (
+    serper_search,
+    serper_maps_search,
+    build_smb_maps_queries,
 )
+from scraping.scrapingant import scrape_with_js
 from scraping.email_scraper import enrich_lead_with_email
 from scraping.osm_search import search_local_businesses
-from scraping.serper_search import serper_search
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
+from config import SCRAPINGANT_API_KEY
 
 
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 async def run_smb_maps(
     query: str,
     user_tier: str = "free",
     country: str = "",
     state_region: str = "",
+    lead_target: int = 50,
     progress_callback: Optional[Callable] = None,
 ) -> List[Dict[str, Any]]:
     """Find local brick-and-mortar businesses matching the user's query."""
-    leads = []
-    lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
+    leads: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
 
-    # Build location string for search
+    # Build a location string for Serper (used by query builders + maps search)
     location_parts = [p for p in [state_region, country] if p]
     location = ", ".join(location_parts) if location_parts else ""
-    search_query = f"{query} {location}".strip() if location else query
+
+    print(f"[SMB_MAPS] Start — query='{query}', tier={user_tier}, target={lead_target}, loc='{location}'")
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data (CONCURRENTLY)
+    # PHASE 1: Serper maps + 10x Serper web searches (CONCURRENT)
     # --------------------------------------------------------
-    # PRIMARY: OpenStreetMap (Overpass + Nominatim) — replaces Google Maps
-    # SUPPLEMENTARY: Serper.dev for Google search results
-    # SUPPLEMENTARY: OpenCorporates for company registry data
-    # All 3 sources fetched concurrently with asyncio.gather
     if progress_callback:
-        await progress_callback(15, f"Searching OpenStreetMap for local businesses in {location or 'your area'}...")
+        await progress_callback(15, f"Searching Google Maps and web for local businesses in {location or 'your area'}...")
 
-    print(f"[SMB_MAPS] Fetching local business data for '{search_query}' (concurrent sources)")
+    web_queries = build_smb_maps_queries(query, location)
 
-    location_string = ", ".join([p for p in [state_region, country] if p]) if (state_region or country) else query
+    # Run maps search + 10 web searches concurrently (11 total fetches)
+    maps_task = serper_maps_search(query, location=location)
+    web_tasks = [serper_search(q, num_results=10) for q in web_queries]
 
-    # Make MULTIPLE Serper searches with different query variations to get more results.
-    # Serper free tier returns max 10 per call, so we make 5 calls concurrently.
-    serper_queries = [
-        f"{search_query} local business",
-        f"{search_query} near {location_string}",
-        f"{search_query} directory {location_string}",
-        f"{search_query} services {location_string}",
-        f"{search_query} company {location_string}",
-    ]
-
-    osm_task = search_local_businesses(query, location=location_string, radius=50000, limit=lead_target)
-    serper_tasks = [serper_search(q, num_results=10) for q in serper_queries]
-    oc_task = stealth_fetch(build_opencorporates_url(query), timeout=SOURCE_TIMEOUT)
-
-    # Gather all tasks concurrently
-    all_results = await asyncio.gather(
-        osm_task,
-        *serper_tasks,
-        oc_task,
-        return_exceptions=True,
+    all_fetches = await asyncio.gather(
+        maps_task, *web_tasks, return_exceptions=True
     )
 
-    # Unpack results
-    osm_businesses = all_results[0]
-    serper_results_list = all_results[1:6]  # 5 Serper results
-    oc_result = all_results[6]
+    maps_results = all_fetches[0]
+    web_results_list = all_fetches[1:]
 
-    scraped_texts = []
-    osm_leads_direct = []  # OSM returns structured businesses we can use directly
+    # --- Process Serper maps results (structured — bypass DeepSeek) ---
+    maps_leads: List[Dict[str, Any]] = []
+    if isinstance(maps_results, list) and maps_results:
+        print(f"[SMB_MAPS] Serper maps returned {len(maps_results)} places")
+        for place in maps_results[:lead_target]:
+            company_name = (place.get("title") or "").strip()
+            if not company_name:
+                continue
+            website_url = place.get("website") or place.get("link") or "ABSENT"
+            rating = _safe_float(place.get("rating"))
+            review_count = _safe_int(place.get("ratingCount"))
+            category = place.get("category") or "ABSENT"
+            address = place.get("address") or "ABSENT"
+            phone = place.get("phone") or "ABSENT"
 
-    # Process OSM results (structured business data — can be used directly without DeepSeek)
-    if isinstance(osm_businesses, list) and osm_businesses:
-        print(f"[SMB_MAPS] OSM returned {len(osm_businesses)} businesses")
-        # Convert OSM businesses to lead format directly (skip DeepSeek structuring for these)
-        for biz in osm_businesses[:lead_target]:
-            if biz.get("name"):
-                osm_leads_direct.append({
-                    "company_name": biz.get("name", "ABSENT"),
-                    "website_url": biz.get("website", "ABSENT") or "ABSENT",
-                    "address": biz.get("address", "ABSENT") or "ABSENT",
-                    "phone": biz.get("phone", "ABSENT") or "ABSENT",
-                    "email": biz.get("email", "ABSENT") or "ABSENT",
-                    "source": "openstreetmap",
-                })
-    elif isinstance(osm_businesses, Exception):
-        print(f"[SMB_MAPS] OSM error: {osm_businesses}")
+            domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
+            if domain_hash in seen_hashes:
+                continue
+            seen_hashes.add(domain_hash)
 
-    # Process ALL Serper.dev results (from 5 concurrent searches)
-    all_serper_results = []
-    for i, serper_results in enumerate(serper_results_list):
-        if isinstance(serper_results, list) and serper_results:
-            all_serper_results.extend(serper_results)
-            print(f"[SMB_MAPS] Serper search {i+1} returned {len(serper_results)} results")
+            maps_leads.append({
+                "domain_hash": domain_hash,
+                "company_name": company_name,
+                "website_url": website_url,
+                "address": address,
+                "phone": phone,
+                "rating": rating,
+                "review_count": review_count,
+                "category": category,
+                "opening_hours": "ABSENT",  # Serper maps doesn't return this
+                "_source": "serper_maps",
+            })
+    elif isinstance(maps_results, Exception):
+        print(f"[SMB_MAPS] Serper maps error: {maps_results}")
+    else:
+        print(f"[SMB_MAPS] Serper maps returned no results")
 
-    if all_serper_results:
-        # Deduplicate by URL
-        seen_urls = set()
-        unique_serper = []
-        for r in all_serper_results:
-            url = r.get('link', '')
+    # --- Process Serper web results (text — needs DeepSeek structuring) ---
+    all_web_results: List[Dict[str, Any]] = []
+    seen_urls: set = set()
+    yelp_urls: List[str] = []
+    for i, r in enumerate(web_results_list):
+        if isinstance(r, Exception):
+            print(f"[SMB_MAPS] Serper web search {i+1} error: {r}")
+            continue
+        if not isinstance(r, list):
+            continue
+        for item in r:
+            url = item.get("link", "")
             if url and url not in seen_urls:
                 seen_urls.add(url)
-                unique_serper.append(r)
+                all_web_results.append(item)
+                if "yelp.com" in url.lower():
+                    yelp_urls.append(url)
 
+    print(f"[SMB_MAPS] Serper web: {len(all_web_results)} unique results across 10 queries "
+          f"(Yelp URLs found: {len(yelp_urls)})")
+
+    # --------------------------------------------------------
+    # PHASE 1b: OPTIONAL — ScrapingAnt for Yelp pages (JS rendering)
+    # --------------------------------------------------------
+    scraped_texts: List[Dict[str, str]] = []
+    if yelp_urls and SCRAPINGANT_API_KEY:
+        if progress_callback:
+            await progress_callback(25, f"Rendering {min(len(yelp_urls), 3)} Yelp pages with ScrapingAnt...")
+
+        # Cap to 3 Yelp pages to conserve ScrapingAnt credits
+        yelp_fetch_tasks = [scrape_with_js(u) for u in yelp_urls[:3]]
+        yelp_htmls = await asyncio.gather(*yelp_fetch_tasks, return_exceptions=True)
+
+        for i, html in enumerate(yelp_htmls):
+            if isinstance(html, str) and html:
+                scraped_texts.append({
+                    "source": f"Yelp (ScrapingAnt) — {yelp_urls[i]}",
+                    "content": html[:8000],
+                })
+                print(f"[SMB_MAPS] Scraped Yelp via ScrapingAnt: {len(html)} chars")
+            elif isinstance(html, Exception):
+                print(f"[SMB_MAPS] Yelp ScrapingAnt error: {html}")
+
+    # Format Serper web results as text for DeepSeek
+    if all_web_results:
         serper_text = "\n\n".join(
             f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
-            for r in unique_serper
+            for r in all_web_results
         )
         scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
-        print(f"[SMB_MAPS] Total unique Serper results: {len(unique_serper)}")
-    elif isinstance(serper_results, Exception):
-        print(f"[SMB_MAPS] Serper.dev error: {serper_results}")
 
-    # Process OpenCorporates result
-    if isinstance(oc_result, dict) and oc_result:
-        text = extract_text_from_html(oc_result["html"])
-        if text:
-            scraped_texts.append({"source": "OpenCorporates", "content": text})
-            print(f"[SMB_MAPS] Scraped OpenCorporates: {len(text)} chars")
-    elif isinstance(oc_result, Exception):
-        print(f"[SMB_MAPS] OpenCorporates error: {oc_result}")
-
-    # If OSM gave us direct leads, process them through validation gates (skip DeepSeek structuring)
-    if osm_leads_direct:
+    # --------------------------------------------------------
+    # PHASE 2: If still short of target, fall back to OSM
+    # --------------------------------------------------------
+    total_so_far = len(maps_leads)
+    if total_so_far < lead_target:
         if progress_callback:
-            await progress_callback(40, f"Validating {len(osm_leads_direct)} businesses from OpenStreetMap...")
+            await progress_callback(30, "Falling back to OpenStreetMap for more local businesses...")
 
-        for biz in osm_leads_direct:
-            company_name = biz["company_name"]
-            website_url = biz["website_url"]
-            address = biz["address"]
+        print(f"[SMB_MAPS] Only {total_so_far}/{lead_target} so far — trying OSM fallback")
+        try:
+            osm_location = location or country or state_region or query
+            osm_businesses = await search_local_businesses(
+                query, location=osm_location, radius=50000, limit=lead_target
+            )
+            if isinstance(osm_businesses, list) and osm_businesses:
+                print(f"[SMB_MAPS] OSM returned {len(osm_businesses)} businesses")
+                osm_text_blocks = []
+                for biz in osm_businesses[:lead_target]:
+                    name = biz.get("name", "").strip()
+                    if not name:
+                        continue
+                    # Build a structured lead directly from OSM (bypass DeepSeek)
+                    website_url = biz.get("website") or "ABSENT"
+                    domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else name)
+                    if domain_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(domain_hash)
 
-            # HARD FILTER: Must have physical address
-            if address == "ABSENT" or not address:
+                    maps_leads.append({
+                        "domain_hash": domain_hash,
+                        "company_name": name,
+                        "website_url": website_url,
+                        "address": biz.get("address") or "ABSENT",
+                        "phone": biz.get("phone") or "ABSENT",
+                        "rating": 0.0,
+                        "review_count": 0,
+                        "category": biz.get("category") or "ABSENT",
+                        "opening_hours": biz.get("opening_hours") or "ABSENT",
+                        "_source": "openstreetmap",
+                    })
+                    # Also include OSM text in DeepSeek structuring in case
+                    # OSM found businesses not yet captured
+                    osm_text_blocks.append(
+                        f"Name: {name}\nAddress: {biz.get('address', '')}\n"
+                        f"Phone: {biz.get('phone', '')}\nWebsite: {biz.get('website', '')}\n"
+                        f"Category: {biz.get('category', '')}"
+                    )
+                if osm_text_blocks:
+                    scraped_texts.append({
+                        "source": "OpenStreetMap (Overpass)",
+                        "content": "\n\n".join(osm_text_blocks),
+                    })
+        except Exception as e:
+            print(f"[SMB_MAPS] OSM fallback error: {e}")
+
+    # --------------------------------------------------------
+    # PHASE 3: DeepSeek structures any remaining text results
+    # --------------------------------------------------------
+    structured_businesses: List[Dict[str, Any]] = []
+    if scraped_texts and len(leads) + len(maps_leads) < lead_target:
+        if progress_callback:
+            await progress_callback(40, "AI is analyzing search results and extracting businesses...")
+
+        combined_text = "\n\n".join(
+            f"--- SOURCE: {s['source']} ---\n{s['content']}"
+            for s in scraped_texts
+        )
+
+        structure_prompt = f"""
+        You are a local business data extractor. Below is REAL TEXT scraped from the internet
+        about local businesses related to: "{query}" in "{location or 'unspecified location'}".
+
+        Extract EVERY REAL business mentioned in this text. Do NOT invent businesses.
+        Be aggressive — aim for 20-50 businesses. Skip chain brands (Walmart, McDonald's, etc.).
+
+        SCRAPED CONTENT:
+        {combined_text[:14000]}
+
+        For each REAL business, provide:
+        - company_name: The exact business name as mentioned
+        - website_url: Their website URL if mentioned (or "ABSENT")
+        - address: Their physical street address if mentioned (or "ABSENT")
+        - phone: Phone number if mentioned (or "ABSENT")
+        - category: Business type if mentioned (or "ABSENT")
+        - rating: Numeric rating if mentioned (or 0)
+        - review_count: Integer review count if mentioned (or 0)
+
+        Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
+        If you cannot find data for a field, write "ABSENT" (or 0 for numeric).
+
+        Example:
+        {{
+            "businesses": [
+                {{
+                    "company_name": "Mike's Roofing LLC",
+                    "website_url": "https://mikesroofing.com",
+                    "address": "123 Main St, Dallas, TX",
+                    "phone": "(555) 123-4567",
+                    "category": "Roofing Contractor",
+                    "rating": 4.8,
+                    "review_count": 127
+                }}
+            ]
+        }}
+        """
+
+        try:
+            response = await execute_llm_payload({
+                "model": DEEPSEEK_SCOUT_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses mentioned in the provided text. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing string data and 0 for missing numeric data."},
+                    {"role": "user", "content": structure_prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+            })
+
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            parsed = json.loads(content)
+            structured_businesses = parsed.get("businesses", parsed.get("results", []))
+            if isinstance(parsed, list):
+                structured_businesses = parsed
+
+            print(f"[SMB_MAPS] DeepSeek extracted {len(structured_businesses)} candidate businesses")
+        except Exception as e:
+            print(f"[SMB_MAPS] DeepSeek structuring error: {e}")
+
+    # --------------------------------------------------------
+    # PHASE 4: Validate & enrich maps_leads (already structured)
+    # --------------------------------------------------------
+    if progress_callback:
+        await progress_callback(50, f"Validating {len(maps_leads)} structured businesses from Serper Maps/OSM...")
+
+    # Process maps leads first (they have the richest structured data)
+    for biz in maps_leads:
+        if len(leads) >= lead_target:
+            break
+
+        company_name = biz["company_name"]
+        website_url = biz.get("website_url", "ABSENT")
+
+        # Gate 1: DNS Check (ALL tiers — only if website exists)
+        gates_passed = 0
+        if website_url != "ABSENT":
+            try:
+                domain_ok, _ = await check_dns(website_url)
+                if not domain_ok:
+                    print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
+                    continue
+                gates_passed = 1
+            except Exception as e:
+                print(f"[SMB_MAPS] DNS check error for {website_url}: {e} — continuing anyway")
+                gates_passed = 1
+
+        # Email scraper enrichment (scrapes website for real emails)
+        try:
+            enrichment = await enrich_lead_with_email(company_name, website_url)
+        except Exception as e:
+            print(f"[SMB_MAPS] Email scraper error for {company_name}: {e}")
+            enrichment = {
+                "verified_email": "ABSENT", "phone": "ABSENT",
+                "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
+            }
+
+        # Prefer scraped phone over maps phone if maps had none
+        phone = biz.get("phone", "ABSENT")
+        if phone == "ABSENT" or not phone:
+            phone = enrichment.get("phone", "ABSENT")
+
+        lead = {
+            "domain_hash": biz["domain_hash"],
+            "company_name": company_name,
+            "website_url": website_url,
+            "dm_name": "ABSENT",
+            "dm_position": "ABSENT",
+            "verified_email": enrichment.get("verified_email", "ABSENT"),
+            "is_catchall": False,
+            "linkedin": enrichment.get("linkedin", "ABSENT"),
+            "instagram": enrichment.get("instagram", "ABSENT"),
+            "facebook": enrichment.get("facebook", "ABSENT"),
+            "phone": phone,
+            "address": biz.get("address", "ABSENT"),
+            "rating": biz.get("rating", 0.0),
+            "review_count": biz.get("review_count", 0),
+            "category": biz.get("category", "ABSENT"),
+            "opening_hours": biz.get("opening_hours", "ABSENT"),
+            "validation_gates_passed": gates_passed,
+        }
+
+        # Pre-filter: Footprint check
+        if not check_footprint(lead):
+            print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
+            continue
+
+        # Gate 2: SMTP (Starter/Growth/Pro)
+        if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
+            try:
+                smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
+                lead["is_catchall"] = is_catchall
+                if not smtp_ok and not is_catchall:
+                    print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
+                    continue
+                gates_passed = 2
+                lead["validation_gates_passed"] = gates_passed
+            except Exception as e:
+                print(f"[SMB_MAPS] SMTP error for {lead['verified_email']}: {e} — lenient accept")
+                gates_passed = 2
+                lead["validation_gates_passed"] = gates_passed
+
+        # Gate 3: DeepSeek AI (Pro only)
+        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+            try:
+                deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
+                if not deepseek_ok:
+                    print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
+                    continue
+                if is_role:
+                    lead["is_catchall"] = True
+                gates_passed = 3
+                lead["validation_gates_passed"] = gates_passed
+            except Exception as e:
+                print(f"[SMB_MAPS] DeepSeek Gate 3 error for {lead['verified_email']}: {e} — lenient accept")
+                gates_passed = 3
+                lead["validation_gates_passed"] = gates_passed
+
+        # Strip internal-only _source key before returning
+        lead.pop("_source", None)
+        leads.append(lead)
+
+    # --------------------------------------------------------
+    # PHASE 5: Validate & enrich DeepSeek-structured businesses
+    # --------------------------------------------------------
+    if structured_businesses and len(leads) < lead_target:
+        if progress_callback:
+            await progress_callback(70, f"Validating {min(len(structured_businesses), lead_target - len(leads))} more businesses from web search...")
+
+        for biz in structured_businesses:
+            if len(leads) >= lead_target:
+                break
+
+            company_name = (biz.get("company_name") or "").strip()
+            website_url = biz.get("website_url", "ABSENT")
+            if not company_name or company_name == "ABSENT":
                 continue
 
             domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
+            if domain_hash in seen_hashes:
+                continue
+            seen_hashes.add(domain_hash)
 
             # Gate 1: DNS Check
             gates_passed = 0
             if website_url != "ABSENT":
-                domain_ok, has_mx = await check_dns(website_url)
-                if not domain_ok:
-                    continue
-                gates_passed = 1
+                try:
+                    domain_ok, _ = await check_dns(website_url)
+                    if not domain_ok:
+                        print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
+                        continue
+                    gates_passed = 1
+                except Exception as e:
+                    print(f"[SMB_MAPS] DNS check error for {website_url}: {e} — continuing anyway")
+                    gates_passed = 1
 
-            # Use OSM-provided contact data directly
+            # Email scraper enrichment
+            try:
+                enrichment = await enrich_lead_with_email(company_name, website_url)
+            except Exception as e:
+                print(f"[SMB_MAPS] Email scraper error for {company_name}: {e}")
+                enrichment = {
+                    "verified_email": "ABSENT", "phone": "ABSENT",
+                    "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
+                }
+
+            # Prefer scraped phone over DeepSeek phone
+            ds_phone = biz.get("phone", "ABSENT")
+            phone = enrichment.get("phone", "ABSENT")
+            if phone == "ABSENT" or not phone:
+                phone = ds_phone
+
             lead = {
                 "domain_hash": domain_hash,
                 "company_name": company_name,
                 "website_url": website_url,
                 "dm_name": "ABSENT",
                 "dm_position": "ABSENT",
-                "verified_email": biz.get("email", "ABSENT"),
+                "verified_email": enrichment.get("verified_email", "ABSENT"),
                 "is_catchall": False,
-                "linkedin": "ABSENT",
-                "instagram": "ABSENT",
-                "facebook": "ABSENT",
-                "phone": biz.get("phone", "ABSENT"),
-                "address": address,
+                "linkedin": enrichment.get("linkedin", "ABSENT"),
+                "instagram": enrichment.get("instagram", "ABSENT"),
+                "facebook": enrichment.get("facebook", "ABSENT"),
+                "phone": phone,
+                "address": biz.get("address", "ABSENT"),
+                "rating": _safe_float(biz.get("rating")),
+                "review_count": _safe_int(biz.get("review_count")),
+                "category": biz.get("category", "ABSENT"),
+                "opening_hours": "ABSENT",
                 "validation_gates_passed": gates_passed,
             }
 
-            # Pre-filter: Footprint check
             if not check_footprint(lead):
-                continue
-
-            # Gate 2: SMTP (Starter+)
-            if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
-                smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
-                lead["is_catchall"] = is_catchall
-                if not smtp_ok and not is_catchall:
-                    continue
-                gates_passed = 2
-                lead["validation_gates_passed"] = gates_passed
-
-            # Gate 3: DeepSeek AI (Pro only)
-            if user_tier == "pro" and lead["verified_email"] != "ABSENT":
-                deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
-                if not deepseek_ok:
-                    continue
-                if is_role:
-                    lead["is_catchall"] = True
-                gates_passed = 3
-                lead["validation_gates_passed"] = gates_passed
-
-            leads.append(lead)
-
-        print(f"[SMB_MAPS] OSM direct leads after validation: {len(leads)}")
-
-    # If we still need more leads, run DeepSeek structuring on the scraped text
-    if len(leads) < lead_target and scraped_texts:
-        combined_text = "\n\n".join(
-            f"--- SOURCE: {s['source']} ---\n{s['content']}"
-            for s in scraped_texts
-        )
-        # Fall through to DeepSeek structuring phase below
-    elif not scraped_texts and not osm_leads_direct:
-        print(f"[SMB_MAPS] All sources failed — no data to process")
-        return leads
-    else:
-        # We have enough OSM leads and no scraped text to process
-        print(f"[SMB_MAPS] Returning {len(leads)} leads from OSM")
-        return leads
-
-    # --------------------------------------------------------
-    # PHASE 2: DeepSeek — Structure the scraped data
-    # --------------------------------------------------------
-    if progress_callback:
-        await progress_callback(35, "AI is analyzing data and extracting local business names...")
-
-    print(f"[SMB_MAPS] DeepSeek structuring phase")
-
-    structure_prompt = f"""
-    You are a local business data extractor. Below is REAL TEXT scraped from the internet
-    about local businesses related to: "{search_query}"
-
-    Your job is to extract EVERY REAL business mentioned in this text.
-    Be AGGRESSIVE — extract as many businesses as you can find. Do NOT skip any.
-    Do NOT invent or hallucinate businesses that are not in the text.
-
-    RULES:
-    - Extract EVERY real business you can find — aim for 20-50 businesses
-    - If address is not mentioned, set it to "ABSENT" (that's OK — we still want the lead)
-    - If website is not mentioned, set it to "ABSENT"
-    - If phone is not mentioned, set it to "ABSENT"
-    - Look for business names in titles, URLs, and snippets
-    - Extract from ALL sources provided
-    - NO chains or large corporations (Walmart, McDonald's, etc.)
-
-    SCRAPED CONTENT:
-    {combined_text[:14000]}
-
-    For each REAL business you find, provide:
-    - company_name: The exact business name as mentioned
-    - website_url: Their website URL if mentioned (or "ABSENT")
-    - address: Their physical street address if mentioned (or "ABSENT")
-    - phone: Phone number if mentioned (or "ABSENT")
-
-    Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
-    If you cannot find data for a field, write "ABSENT".
-
-    Example format:
-    {{
-        "businesses": [
-            {{
-                "company_name": "Mike's Roofing LLC",
-                "website_url": "https://mikesroofing.com",
-                "address": "123 Main St, Dallas, TX",
-                "phone": "(555) 123-4567"
-            }}
-        ]
-    }}
-    """
-
-    businesses = []
-    try:
-        response = await execute_llm_payload({
-            "model": DEEPSEEK_SCOUT_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a precise data extractor. Only extract REAL businesses mentioned in the provided text. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
-                {"role": "user", "content": structure_prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        })
-
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        parsed = json.loads(content)
-        businesses = parsed.get("businesses", parsed.get("results", []))
-        if isinstance(parsed, list):
-            businesses = parsed
-
-    except Exception as e:
-        print(f"[SMB_MAPS] DeepSeek structuring error: {e}")
-
-    print(f"[SMB_MAPS] DeepSeek extracted {len(businesses)} candidate businesses")
-
-    # --------------------------------------------------------
-    # PHASE 3: FILTER, VALIDATE & ENRICH
-    # --------------------------------------------------------
-    if progress_callback:
-        await progress_callback(50, f"Filtering and enriching {min(len(businesses), lead_target)} local businesses...")
-
-    for biz in businesses[:lead_target]:
-        company_name = biz.get("company_name", "ABSENT")
-        website_url = biz.get("website_url", "ABSENT")
-        address = biz.get("address", "ABSENT")
-        phone = biz.get("phone", "ABSENT")
-
-        # HARD FILTER: Must have a company name
-        if company_name == "ABSENT" or not company_name:
-            continue
-
-        # SOFT FILTER: Address is preferred but NOT required.
-        # Many businesses from Serper/Google don't have addresses in snippets,
-        # but they still have websites and contact info. Keep them.
-        if address == "ABSENT" or not address:
-            print(f"[SMB_MAPS] {company_name} has no address — keeping anyway (will enrich from website)")
-
-        domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
-
-        # Gate 1: DNS Check
-        gates_passed = 0
-        if website_url != "ABSENT":
-            domain_ok, has_mx = await check_dns(website_url)
-            if not domain_ok:
-                print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
-                continue
-            gates_passed = 1
-
-        # Enrich with email scraper (scrapes the website for real emails — much
-        # better than DeepSeek which often returns "ABSENT")
-        enrichment = await enrich_lead_with_email(company_name, website_url)
-
-        lead = {
-            "domain_hash": domain_hash,
-            "company_name": company_name,
-            "website_url": website_url,
-            "dm_name": enrichment.get("dm_name", "ABSENT"),
-            "dm_position": enrichment.get("dm_position", "ABSENT"),
-            "verified_email": enrichment.get("verified_email", "ABSENT"),
-            "is_catchall": False,
-            "linkedin": enrichment.get("linkedin", "ABSENT"),
-            "instagram": enrichment.get("instagram", "ABSENT"),
-            "facebook": enrichment.get("facebook", "ABSENT"),
-            "phone": enrichment.get("phone", "ABSENT") if enrichment.get("phone", "ABSENT") != "ABSENT" else phone,
-            "address": address,
-            "validation_gates_passed": gates_passed,
-        }
-
-        # Pre-filter: Footprint check (relaxed — a business with just a
-        # website or company name is still useful, don't drop it)
-        if not check_footprint(lead):
-            # If enrichment gave us nothing, try using the phone from DeepSeek
-            if phone and phone != "ABSENT":
-                lead["phone"] = phone
-                if not check_footprint(lead):
-                    print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
-                    continue
-            else:
                 print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
                 continue
 
-        # Gate 2: SMTP (Starter+)
-        if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
-            smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
-            lead["is_catchall"] = is_catchall
-            if not smtp_ok and not is_catchall:
-                print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
-                continue
-            gates_passed = 2
-            lead["validation_gates_passed"] = gates_passed
+            # Gate 2: SMTP (Starter/Growth/Pro)
+            if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
+                try:
+                    smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
+                    lead["is_catchall"] = is_catchall
+                    if not smtp_ok and not is_catchall:
+                        print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
+                        continue
+                    gates_passed = 2
+                    lead["validation_gates_passed"] = gates_passed
+                except Exception as e:
+                    print(f"[SMB_MAPS] SMTP error for {lead['verified_email']}: {e} — lenient accept")
+                    gates_passed = 2
+                    lead["validation_gates_passed"] = gates_passed
 
-        # Gate 3: DeepSeek AI (Pro only)
-        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
-            deepseek_ok, is_role, reason = await check_deepseek(lead["verified_email"], company_name)
-            if not deepseek_ok:
-                print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
-                continue
-            if is_role:
-                lead["is_catchall"] = True
-            gates_passed = 3
-            lead["validation_gates_passed"] = gates_passed
+            # Gate 3: DeepSeek AI (Pro only)
+            if user_tier == "pro" and lead["verified_email"] != "ABSENT":
+                try:
+                    deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
+                    if not deepseek_ok:
+                        print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
+                        continue
+                    if is_role:
+                        lead["is_catchall"] = True
+                    gates_passed = 3
+                    lead["validation_gates_passed"] = gates_passed
+                except Exception as e:
+                    print(f"[SMB_MAPS] DeepSeek Gate 3 error for {lead['verified_email']}: {e} — lenient accept")
+                    gates_passed = 3
+                    lead["validation_gates_passed"] = gates_passed
 
-        leads.append(lead)
+            leads.append(lead)
+
+    if progress_callback:
+        await progress_callback(90, f"Found {len(leads)} verified local businesses")
 
     print(f"[SMB_MAPS] Returning {len(leads)} verified leads")
     return leads
 
 
-async def _enrich_local_lead(
-    company_name: str,
-    website_url: str,
-    address: str,
-    user_tier: str,
-) -> Dict[str, str]:
-    """Enrich a local business lead with DM details."""
-    scraped_website_text = ""
-
-    if website_url and website_url != "ABSENT":
-        print(f"[SMB_MAPS] Fetching company website {website_url}")
-        site_result = await stealth_fetch(website_url, timeout=15)
-        if site_result:
-            scraped_website_text = extract_text_from_html(site_result["html"], max_chars=8000)
-
-    if scraped_website_text:
-        prompt = f"""
-        You are a local business researcher. Below is REAL TEXT scraped from the website of:
-        "{company_name}" located at "{address}" ({website_url})
-
-        Extract the following information from this scraped content:
-        - dm_name: Full name of the owner, CEO, or founder
-        - dm_position: Their job title
-        - verified_email: Their work or business email
-        - linkedin: Their LinkedIn profile URL
-        - instagram: The business Instagram URL
-        - facebook: The business Facebook URL
-        - phone: The business phone number
-
-        SCRAPED WEBSITE CONTENT:
-        {scraped_website_text[:8000]}
-
-        Only extract information that is clearly present in the scraped text.
-        If you cannot find any piece of information, write "ABSENT".
-        Return a single JSON object.
-        """
-    else:
-        prompt = f"""
-        You are a local business researcher. Find the owner or key decision maker for:
-        "{company_name}" located at "{address}" ({website_url})
-
-        Look for:
-        - dm_name: Full name of the owner, CEO, or founder
-        - dm_position: Their job title
-        - verified_email: Their work or business email
-        - linkedin: Their LinkedIn profile URL
-        - instagram: The business Instagram URL
-        - facebook: The business Facebook URL
-        - phone: The business phone number
-
-        If you cannot find any piece of information, write "ABSENT".
-        Return a single JSON object.
-        """
-
+# ============================================================
+# HELPERS
+# ============================================================
+def _safe_float(value: Any) -> float:
+    """Convert a value to a float, returning 0.0 on failure."""
     try:
-        response = await execute_llm_payload({
-            "model": DEEPSEEK_SCOUT_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a precise data extractor. Only extract information from the provided text when available. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        })
+        if value is None or value == "" or value == "ABSENT":
+            return 0.0
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
 
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        return json.loads(content)
 
-    except Exception as e:
-        print(f"[SMB_MAPS] Enrichment error for {company_name}: {e}")
-        return {
-            "dm_name": "ABSENT",
-            "dm_position": "ABSENT",
-            "verified_email": "ABSENT",
-            "linkedin": "ABSENT",
-            "instagram": "ABSENT",
-            "facebook": "ABSENT",
-            "phone": "ABSENT",
-        }
+def _safe_int(value: Any) -> int:
+    """Convert a value to an int, returning 0 on failure."""
+    try:
+        if value is None or value == "" or value == "ABSENT":
+            return 0
+        return int(float(value))
+    except (ValueError, TypeError):
+        return 0

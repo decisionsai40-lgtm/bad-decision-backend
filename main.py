@@ -35,8 +35,21 @@ from config import (
 app = FastAPI(
     title="Bad Decision — Backend Engine",
     description="The scraping and validation engine that powers Bad Decision",
-    version="3.0.0",
+    version="4.0.0",
 )
+
+# ============================================================
+# SECURITY HEADERS — Prevent clickjacking, MIME sniffing, XSS
+# ============================================================
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'none'"
+    return response
 
 # ============================================================
 # CORS — Restricted to the Vercel frontend domain

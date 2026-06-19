@@ -1,25 +1,12 @@
 """
-BAD DECISION — Stealth Web Fetcher (Scrapling)
-===============================================
+BAD DECISION — Stealth Web Fetcher (Scrapling + selectolax)
+==============================================================
 Uses Scrapling's Fetcher mode (curl_cffi backend) to fetch web pages
-with Chrome TLS fingerprint impersonation.
+with Chrome TLS fingerprint impersonation. Uses selectolax for fast
+HTML parsing (30x faster than BeautifulSoup).
 
-WHAT THIS BYPASSES:
-  - TLS fingerprinting (JA3/JA4) — looks like real Chrome
-  - Basic header-based bot detection — auto-generates real browser headers
-  - HTTP/2 fingerprinting — mimics browser connection patterns
-
-WHAT THIS DOES NOT BYPASS (would need StealthyFetcher + browser):
-  - Cloudflare JS challenges / Turnstile CAPTCHA
-  - DataDome / PerimeterX / Kasada advanced protections
-  - Sites requiring JavaScript execution
-
-NO browser or Playwright required — works on Render free tier.
-
-NOTE: This module is now used ONLY for static HTML pages (Meta Ads Library,
-Yelp, Houzz, Reddit, GitHub, OpenCorporates, company websites). All Google
-search queries go through Serper.dev (see scraping/serper_search.py) and all
-local business queries go through OpenStreetMap (see scraping/osm_search.py).
+NOTE: This module is used for static HTML pages only. For JS-heavy
+sites (Yelp, Reddit, Meta Ads), use scraping/scrapingant.py instead.
 """
 
 from scrapling import Fetcher
@@ -41,7 +28,7 @@ async def stealth_fetch(
 
     Args:
         url: The webpage to fetch
-        timeout: How many seconds to wait before giving up (default 15)
+        timeout: How many seconds to wait before giving up
 
     Returns:
         Dictionary with page content and status, or None if failed
@@ -69,49 +56,147 @@ async def stealth_fetch(
 
 def extract_text_from_html(html: str, max_chars: int = 15000) -> str:
     """
-    Strip HTML tags and return clean text, truncated to max_chars.
-    This is passed to DeepSeek for structuring — we don't want to
-    send raw HTML because it wastes tokens.
+    Strip HTML tags and return clean text using selectolax.
+    30x faster than BeautifulSoup.
+
+    Args:
+        html: Raw HTML string
+        max_chars: Maximum characters to return
+
+    Returns:
+        Clean text extracted from the HTML
     """
     if not html:
         return ""
 
-    # Remove script and style blocks entirely
-    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    try:
+        from selectolax.parser import HTMLParser
 
-    # Remove HTML tags
-    text = re.sub(r'<[^>]+>', ' ', text)
+        tree = HTMLParser(html)
 
-    # Clean up whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
+        # Remove script and style tags
+        for tag in tree.css("script"):
+            tag.decompose()
+        for tag in tree.css("style"):
+            tag.decompose()
+        for tag in tree.css("noscript"):
+            tag.decompose()
 
-    # Decode common HTML entities
-    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    text = text.replace('&quot;', '"').replace('&#39;', "'")
-    text = text.replace('&nbsp;', ' ')
+        # Get text
+        text = tree.text(separator=" ", strip=True)
 
-    return text[:max_chars]
+        # Decode common HTML entities
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        text = text.replace("&quot;", '"').replace("&#39;", "'")
+        text = text.replace("&nbsp;", " ")
+
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text[:max_chars]
+
+    except ImportError:
+        # Fallback to regex if selectolax is not installed
+        text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        text = text.replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
+        return text[:max_chars]
 
 
 def extract_links_from_html(html: str, base_url: str = "") -> List[str]:
-    """Extract all href links from HTML."""
+    """Extract all href links from HTML using selectolax."""
     if not html:
         return []
-    links = re.findall(r'href=["\'](https?://[^"\']+)', html, re.IGNORECASE)
-    if base_url:
-        # Also grab relative links
-        rel_links = re.findall(r'href=["\'](/[^"\']+)', html, re.IGNORECASE)
-        links.extend([urljoin(base_url, link) for link in rel_links])
-    return list(set(links))
+
+    try:
+        from selectolax.parser import HTMLParser
+
+        tree = HTMLParser(html)
+        links = []
+
+        for node in tree.css("a[href]"):
+            href = node.attributes.get("href", "")
+            if href:
+                if href.startswith("http"):
+                    links.append(href)
+                elif href.startswith("/") and base_url:
+                    links.append(urljoin(base_url, href))
+
+        return list(set(links))
+
+    except ImportError:
+        # Fallback to regex
+        links = re.findall(r'href=["\'](https?://[^"\']+)', html, re.IGNORECASE)
+        if base_url:
+            rel_links = re.findall(r'href=["\'](/[^"\']+)', html, re.IGNORECASE)
+            links.extend([urljoin(base_url, link) for link in rel_links])
+        return list(set(links))
+
+
+def extract_emails_from_html(html: str) -> List[str]:
+    """Extract all email addresses from HTML using selectolax + regex."""
+    if not html:
+        return []
+
+    from selectolax.parser import HTMLParser
+
+    tree = HTMLParser(html)
+
+    # Remove scripts (they contain tracking pixels and fake emails)
+    for tag in tree.css("script"):
+        tag.decompose()
+
+    emails = set()
+
+    # Find mailto: links
+    for node in tree.css("a[href^='mailto:']"):
+        href = node.attributes.get("href", "")
+        if href.startswith("mailto:"):
+            email = href[7:].split("?")[0].lower().strip()  # Remove ?subject= etc.
+            if email and "@" in email:
+                emails.add(email)
+
+    # Find emails in text
+    text = tree.text(separator=" ")
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+    for match in email_pattern.finditer(text):
+        email = match.group(0).lower().strip()
+        if email and not _is_spammy_email(email):
+            emails.add(email)
+
+    return list(emails)
+
+
+def _is_spammy_email(email: str) -> bool:
+    """Check if an email is likely spammy or not a real business email."""
+    if not email:
+        return True
+    if any(email.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']):
+        return True
+    if len(email) > 100:
+        return True
+
+    suspicious_domains = [
+        'example.com', 'test.com', 'sentry.io', 'wixpress.com',
+        'godaddy.com', 'cloudflare.com', 'google.com', 'facebook.com',
+        'twitter.com', 'instagram.com', 'linkedin.com', 'youtube.com',
+        'noreply.github.com', 'example.org', 'sentry-next.wixpress.com'
+    ]
+    domain = email.split('@')[-1] if '@' in email else ''
+    if domain in suspicious_domains:
+        return True
+
+    if re.match(r'^[a-f0-9]{32}@', email):
+        return True
+
+    return False
 
 
 # ============================================================
-# PLATFORM-SPECIFIC URL BUILDERS
-# These construct the exact URLs Scrapling will fetch.
-# Google Search and Google Maps URL builders have been REMOVED —
-# use Serper.dev (scraping/serper_search.py) and OpenStreetMap
-# (scraping/osm_search.py) instead.
+# URL BUILDERS (only for sites that work with static HTML)
 # ============================================================
 
 def build_meta_ads_library_url(query: str) -> str:
@@ -135,7 +220,7 @@ def build_houzz_search_url(query: str) -> str:
 
 
 def build_github_search_url(query: str) -> str:
-    """Build a GitHub Discussions/Issues search URL."""
+    """Build a GitHub search URL."""
     q = quote_plus(query)
     return f"https://github.com/search?q={q}&type=issues"
 

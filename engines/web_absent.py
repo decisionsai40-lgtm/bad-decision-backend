@@ -1,18 +1,27 @@
 """
-BAD DECISION — Engine 3: Web-Absent Businesses
-===============================================
+BAD DECISION — Engine 3: web_absent (Businesses Without Websites)
+================================================================
 This engine finds businesses that exist ONLY on aggregator sites
-(Yelp, Houzz, Etsy) and do NOT have their own website.
+(Yelp, Houzz, Etsy, Facebook, etc.) and do NOT have their own
+standalone website. These are prime targets for web-design agencies.
 
 PIPELINE:
-  1. Fetch aggregator data (Serper.dev in Tier 3, Scrapling for now)
-  2. DeepSeek structures the scraped text into clean lead objects
-  3. HARD FILTER: Drop any business that HAS an external website link
-  4. Validation gates run (Footprint pre-filter + SMTP + DeepSeek based on tier)
-  5. Skip Gate 1 (DNS) — these businesses have no website to check
+  1. 10x concurrent Serper web searches (build_web_absent_queries —
+     targets site:yelp.com, site:houzz.com, site:etsy.com, etc.)
+  2. ScrapingAnt fetches any Yelp/Houzz URLs found (JS rendering —
+     currently 403 without it)
+  3. DeepSeek structures the text, identifying businesses WITHOUT
+     external websites
+  4. Email scraper tries aggregator profile pages
+  5. SKIP Gate 1 (DNS) — these businesses have no website to check
+  6. Footprint check → Gate 2 (SMTP, Starter+) → Gate 3 (DeepSeek, Pro)
+  7. HARD FILTER: Drop any business that HAS an external website
 
-HARD RULE: If the profile has a link to an external http domain,
-DROP the row. These businesses need a website built for them.
+UNIQUE FIELDS:
+  - aggregator_source  (string — "Yelp", "Houzz", "Etsy", "Facebook", etc.)
+  - aggregator_url     (string — direct link to profile)
+  - aggregator_rating  (float — rating on the aggregator)
+  - needs_website      (boolean — always true for this engine)
 """
 
 import json
@@ -20,88 +29,133 @@ import asyncio
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Callable, Optional
 
+from scraping.serper_search import serper_search, build_web_absent_queries
+from scraping.scrapingant import scrape_with_js
 from scraping.stealth_fetcher import (
-    stealth_fetch,
-    extract_text_from_html,
     extract_links_from_html,
     build_yelp_search_url,
     build_houzz_search_url,
 )
-from scraping.serper_search import serper_search, build_serper_query_for_aggregators
+from scraping.email_scraper import enrich_lead_with_email
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import LEAD_TARGET_FREE, LEAD_TARGET_PAID, SOURCE_TIMEOUT
+from config import SCRAPINGANT_API_KEY
 
 
+# Aggregator domains we expect businesses to be ON (not their own website)
+AGGREGATOR_DOMAINS = {
+    "yelp.com", "houzz.com", "etsy.com", "facebook.com",
+    "instagram.com", "nextdoor.com", "angi.com", "thumbtack.com",
+    "bark.com", "google.com", "maps.google.com",
+}
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 async def run_web_absent(
     query: str,
     user_tier: str = "free",
     country: str = "",
     state_region: str = "",
+    lead_target: int = 50,
     progress_callback: Optional[Callable] = None,
 ) -> List[Dict[str, Any]]:
     """Find businesses without their own website — only on aggregator sites."""
-    leads = []
-    lead_target = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
+    leads: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
+
+    location_parts = [p for p in [state_region, country] if p]
+    location = ", ".join(location_parts) if location_parts else ""
+
+    print(f"[WEB_ABSENT] Start — query='{query}', tier={user_tier}, target={lead_target}, loc='{location}'")
 
     # --------------------------------------------------------
-    # PHASE 1: Fetch real data from aggregator sites (CONCURRENTLY)
+    # PHASE 1: 10x Serper web searches + ScrapingAnt for Yelp/Houzz (CONCURRENT)
     # --------------------------------------------------------
-    # PRIMARY: Serper.dev for site:yelp.com OR site:houzz.com OR site:etsy.com queries
-    # SUPPLEMENTARY: Scrapling fetch of Yelp search page
-    # SUPPLEMENTARY: Scrapling fetch of Houzz search page
-    # All fetched concurrently with asyncio.gather
     if progress_callback:
-        await progress_callback(15, "Searching Yelp, Houzz, and Etsy for businesses without websites...")
+        await progress_callback(15, "Searching Yelp, Houzz, Etsy, and Facebook for businesses without websites...")
 
-    print(f"[WEB_ABSENT] Fetching aggregator data for '{query}' (concurrent sources)")
+    web_queries = build_web_absent_queries(query, location)
+    web_tasks = [serper_search(q, num_results=10) for q in web_queries]
 
-    serper_query = build_serper_query_for_aggregators(query)
-    yelp_url = build_yelp_search_url(query, state_region or country)
-    houzz_url = build_houzz_search_url(query)
+    # Optionally fetch Yelp + Houzz search pages via ScrapingAnt (JS rendering)
+    js_tasks: List[Any] = []
+    js_source_names: List[str] = []
+    if SCRAPINGANT_API_KEY:
+        yelp_url = build_yelp_search_url(query, state_region or country)
+        houzz_url = build_houzz_search_url(query)
+        js_tasks = [scrape_with_js(yelp_url), scrape_with_js(houzz_url)]
+        js_source_names = ["Yelp (ScrapingAnt)", "Houzz (ScrapingAnt)"]
+    else:
+        print("[WEB_ABSENT] ScrapingAnt not configured — skipping Yelp/Houzz JS fetches")
 
-    serper_results, yelp_result, houzz_result = await asyncio.gather(
-        serper_search(serper_query, num_results=20),
-        stealth_fetch(yelp_url, timeout=SOURCE_TIMEOUT),
-        stealth_fetch(houzz_url, timeout=SOURCE_TIMEOUT),
-        return_exceptions=True,
-    )
+    all_fetches = await asyncio.gather(*web_tasks, *js_tasks, return_exceptions=True)
 
-    scraped_texts = []
+    web_results_list = all_fetches[:len(web_tasks)]
+    js_results_list = all_fetches[len(web_tasks):]
 
-    # Process Serper.dev results (PRIMARY — replaces Google scraping)
-    if isinstance(serper_results, list) and serper_results:
-        serper_text = "\n".join(
+    # --- Process Serper web results (dedup by URL) ---
+    all_web_results: List[Dict[str, Any]] = []
+    seen_urls: set = set()
+    for i, r in enumerate(web_results_list):
+        if isinstance(r, Exception):
+            print(f"[WEB_ABSENT] Serper web search {i+1} error: {r}")
+            continue
+        if not isinstance(r, list):
+            continue
+        for item in r:
+            url = item.get("link", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_web_results.append(item)
+
+    print(f"[WEB_ABSENT] Serper web: {len(all_web_results)} unique results across 10 queries")
+
+    # Collect aggregator profile URLs (from Serper results) for later ScrapingAnt deep-fetch
+    aggregator_profile_urls: List[str] = []
+    for item in all_web_results:
+        url = item.get("link", "")
+        if not url:
+            continue
+        try:
+            host = (urlparse(url).netloc or "").lower()
+            if any(agg in host for agg in AGGREGATOR_DOMAINS):
+                aggregator_profile_urls.append(url)
+        except Exception:
+            pass
+
+    # --- Process ScrapingAnt JS-rendered pages ---
+    scraped_texts: List[Dict[str, Any]] = []
+    for i, html in enumerate(js_results_list):
+        source_name = js_source_names[i] if i < len(js_source_names) else f"JS source {i+1}"
+        if isinstance(html, str) and html:
+            # Extract external (non-aggregator) links for the hard filter
+            base_url = "https://www.yelp.com" if "yelp" in source_name.lower() else "https://www.houzz.com"
+            links = extract_links_from_html(html, base_url=base_url)
+            scraped_texts.append({
+                "source": source_name,
+                "content": html[:8000],
+                "links": links,
+            })
+            print(f"[WEB_ABSENT] Scraped {source_name}: {len(html)} chars, {len(links)} links")
+        elif isinstance(html, Exception):
+            print(f"[WEB_ABSENT] {source_name} fetch error: {html}")
+
+    # Format Serper web results as text for DeepSeek
+    if all_web_results:
+        serper_text = "\n\n".join(
             f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
-            for r in serper_results
+            for r in all_web_results
         )
-        scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text, "links": [r.get("link", "") for r in serper_results if r.get("link")]})
-        print(f"[WEB_ABSENT] Serper.dev returned {len(serper_results)} results")
-    elif isinstance(serper_results, Exception):
-        print(f"[WEB_ABSENT] Serper.dev error: {serper_results}")
-
-    # Process Yelp result
-    if isinstance(yelp_result, dict) and yelp_result:
-        text = extract_text_from_html(yelp_result["html"])
-        links = extract_links_from_html(yelp_result["html"], base_url="https://www.yelp.com")
-        if text:
-            scraped_texts.append({"source": "Yelp", "content": text, "links": links})
-            print(f"[WEB_ABSENT] Scraped Yelp: {len(text)} chars, {len(links)} links")
-    elif isinstance(yelp_result, Exception):
-        print(f"[WEB_ABSENT] Yelp error: {yelp_result}")
-
-    # Process Houzz result
-    if isinstance(houzz_result, dict) and houzz_result:
-        text = extract_text_from_html(houzz_result["html"])
-        links = extract_links_from_html(houzz_result["html"], base_url="https://www.houzz.com")
-        if text:
-            scraped_texts.append({"source": "Houzz", "content": text, "links": links})
-            print(f"[WEB_ABSENT] Scraped Houzz: {len(text)} chars, {len(links)} links")
-    elif isinstance(houzz_result, Exception):
-        print(f"[WEB_ABSENT] Houzz error: {houzz_result}")
+        scraped_texts.append({
+            "source": "Google Search (Serper.dev)",
+            "content": serper_text,
+            "links": [r.get("link", "") for r in all_web_results if r.get("link")],
+        })
 
     if not scraped_texts:
         print(f"[WEB_ABSENT] All sources failed — no data to process")
@@ -112,65 +166,106 @@ async def run_web_absent(
         for s in scraped_texts
     )
 
-    # Collect all external links found in the scraped pages
-    all_external_links = set()
-    aggregator_domains = {"yelp.com", "houzz.com", "zillow.com", "etsy.com", "amazon.com",
-                          "facebook.com", "google.com", "instagram.com"}
+    # Collect all external (non-aggregator) links — these signal HAS a website
+    all_external_links: set = set()
     for s in scraped_texts:
-        for link in s.get("links", []):
+        for link in s.get("links", []) or []:
             try:
-                domain = urlparse(link).netloc.lower()
-                if domain and not any(agg in domain for agg in aggregator_domains):
+                host = (urlparse(link).netloc or "").lower()
+                if host and not any(agg in host for agg in AGGREGATOR_DOMAINS):
                     all_external_links.add(link)
-            except:
+            except Exception:
                 pass
+
+    # --------------------------------------------------------
+    # PHASE 1b: OPTIONAL — ScrapingAnt deep-fetch on aggregator profile URLs
+    # --------------------------------------------------------
+    if SCRAPINGANT_API_KEY and aggregator_profile_urls and len(leads) < lead_target:
+        # Cap at 3 profile fetches to conserve ScrapingAnt credits
+        deep_fetch_urls = aggregator_profile_urls[:3]
+        if progress_callback:
+            await progress_callback(25, f"Rendering {len(deep_fetch_urls)} aggregator profile pages with ScrapingAnt...")
+
+        print(f"[WEB_ABSENT] ScrapingAnt deep-fetch on {len(deep_fetch_urls)} profile URLs")
+        deep_tasks = [scrape_with_js(u) for u in deep_fetch_urls]
+        deep_htmls = await asyncio.gather(*deep_tasks, return_exceptions=True)
+
+        for i, html in enumerate(deep_htmls):
+            if isinstance(html, str) and html:
+                scraped_texts.append({
+                    "source": f"Aggregator profile (ScrapingAnt) — {deep_fetch_urls[i]}",
+                    "content": html[:6000],
+                    "links": extract_links_from_html(html, base_url=deep_fetch_urls[i]),
+                })
+                # Update external links set
+                for link in extract_links_from_html(html, base_url=deep_fetch_urls[i]):
+                    try:
+                        host = (urlparse(link).netloc or "").lower()
+                        if host and not any(agg in host for agg in AGGREGATOR_DOMAINS):
+                            all_external_links.add(link)
+                    except Exception:
+                        pass
+            elif isinstance(html, Exception):
+                print(f"[WEB_ABSENT] ScrapingAnt profile fetch error: {html}")
+
+        # Rebuild combined_text with the new sources
+        combined_text = "\n\n".join(
+            f"--- SOURCE: {s['source']} ---\n{s['content']}"
+            for s in scraped_texts
+        )
 
     # --------------------------------------------------------
     # PHASE 2: DeepSeek — Structure the scraped data
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(35, "AI is analyzing aggregator data and extracting business names...")
+        await progress_callback(35, "AI is analyzing aggregator data and finding businesses without websites...")
 
     print(f"[WEB_ABSENT] DeepSeek structuring phase")
 
     structure_prompt = f"""
     You are a business data extractor. Below is REAL TEXT scraped from the internet
     about businesses listed on aggregator platforms related to: "{query}"
+    in "{location or 'unspecified location'}".
 
-    Your job is to extract REAL businesses mentioned in this text.
-    Do NOT invent or hallucinate businesses that are not in the text.
+    Extract REAL businesses mentioned in this text. Do NOT invent businesses.
 
     HARD RULES:
-    - The business must NOT have its own standalone website
-    - The business must exist ONLY on the aggregator platform
-    - If a business has a link to an external website, EXCLUDE it
+    - The business must NOT have its own standalone external website
+    - The business should exist ONLY on the aggregator platform (Yelp, Houzz, Etsy, etc.)
+    - If a business clearly has its own external http(s) domain, EXCLUDE it
 
     SCRAPED CONTENT:
     {combined_text[:12000]}
 
     For each REAL business you find, provide:
     - company_name: The exact business name as mentioned
-    - aggregator_source: Which platform they are on (Yelp, Houzz, etc.)
+    - aggregator_source: Which platform they are on (Yelp, Houzz, Etsy, Facebook, etc.)
     - aggregator_url: Direct URL to their profile on the aggregator (or "ABSENT")
+    - aggregator_rating: Numeric rating if mentioned (or 0)
     - has_external_website: true or false (MUST be false to be included)
+    - phone: Phone number if mentioned (or "ABSENT")
+    - email: Email address if mentioned on the aggregator profile (or "ABSENT")
 
     Return a JSON object with a "businesses" array. Find up to {lead_target} businesses.
-    If you cannot find data for a field, write "ABSENT".
+    If you cannot find data for a field, write "ABSENT" (or 0 for rating).
 
-    Example format:
+    Example:
     {{
         "businesses": [
             {{
                 "company_name": "Sunset Bakery",
                 "aggregator_source": "Yelp",
                 "aggregator_url": "https://yelp.com/biz/sunset-bakery",
-                "has_external_website": false
+                "aggregator_rating": 4.5,
+                "has_external_website": false,
+                "phone": "(555) 987-6543",
+                "email": "ABSENT"
             }}
         ]
     }}
     """
 
-    businesses = []
+    businesses: List[Dict[str, Any]] = []
     try:
         response = await execute_llm_payload({
             "model": DEEPSEEK_SCOUT_MODEL,
@@ -200,47 +295,82 @@ async def run_web_absent(
         await progress_callback(50, f"Filtering and enriching {min(len(businesses), lead_target)} businesses...")
 
     for biz in businesses[:lead_target]:
-        company_name = biz.get("company_name", "ABSENT")
-        aggregator_source = biz.get("aggregator_source", "ABSENT")
-        aggregator_url = biz.get("aggregator_url", "ABSENT")
-        has_external_website = biz.get("has_external_website", True)
+        if len(leads) >= lead_target:
+            break
 
-        if company_name == "ABSENT" or not company_name:
+        company_name = (biz.get("company_name") or "").strip()
+        aggregator_source = (biz.get("aggregator_source") or "ABSENT").strip() or "ABSENT"
+        aggregator_url = biz.get("aggregator_url", "ABSENT")
+        aggregator_rating = _safe_float(biz.get("aggregator_rating"))
+        has_external_website = biz.get("has_external_website", False)
+        ds_phone = biz.get("phone", "ABSENT")
+        ds_email = biz.get("email", "ABSENT")
+
+        if not company_name or company_name == "ABSENT":
             continue
 
         # HARD FILTER: Must NOT have an external website
-        if has_external_website is True or has_external_website == "true":
+        if has_external_website is True or str(has_external_website).lower() == "true":
             print(f"[WEB_ABSENT] {company_name} has external website — DROPPED")
             continue
 
+        # Cross-check: if the aggregator_url itself links to an external site, drop
         if aggregator_url != "ABSENT" and aggregator_url in all_external_links:
-            print(f"[WEB_ABSENT] {company_name} aggregator URL links to external site — DROPPED")
+            print(f"[WEB_ABSENT] {company_name} aggregator URL is external — DROPPED")
+            continue
+
+        # Detect if the company_name itself includes a standalone domain
+        # (DeepSeek sometimes pastes the website into company_name)
+        if _looks_like_external_domain(company_name, all_external_links):
+            print(f"[WEB_ABSENT] {company_name} looks like an external domain — DROPPED")
             continue
 
         domain_hash = compute_domain_hash(aggregator_url if aggregator_url != "ABSENT" else company_name)
+        if domain_hash in seen_hashes:
+            continue
+        seen_hashes.add(domain_hash)
 
-        # NOTE: We SKIP Gate 1 (DNS) for web-absent businesses — no website to check.
+        # SKIP Gate 1 (DNS) — these businesses have no website to check
         gates_passed = 0
 
-        # Enrich with DeepSeek
-        enrichment = await _enrich_aggregator_lead(
-            company_name, aggregator_source, aggregator_url, user_tier
-        )
+        # Email scraper tries the aggregator profile page (no website)
+        # We pass aggregator_url as the "website" so the scraper tries to extract
+        # emails/phones from the aggregator profile itself.
+        enrichment_url = aggregator_url if aggregator_url != "ABSENT" else "ABSENT"
+        try:
+            enrichment = await enrich_lead_with_email(company_name, enrichment_url)
+        except Exception as e:
+            print(f"[WEB_ABSENT] Email scraper error for {company_name}: {e}")
+            enrichment = {
+                "verified_email": "ABSENT", "phone": "ABSENT",
+                "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
+            }
+
+        # Prefer DeepSeek's email/phone if scraper didn't find any
+        verified_email = enrichment.get("verified_email", "ABSENT")
+        if (verified_email == "ABSENT" or not verified_email) and ds_email != "ABSENT":
+            verified_email = ds_email
+
+        phone = enrichment.get("phone", "ABSENT")
+        if (phone == "ABSENT" or not phone) and ds_phone != "ABSENT":
+            phone = ds_phone
 
         lead = {
             "domain_hash": domain_hash,
             "company_name": company_name,
-            "website_url": aggregator_url,
-            "dm_name": enrichment.get("dm_name", "ABSENT"),
-            "dm_position": enrichment.get("dm_position", "ABSENT"),
-            "verified_email": enrichment.get("verified_email", "ABSENT"),
+            "website_url": "ABSENT",  # By definition these businesses have no website
+            "dm_name": "ABSENT",
+            "dm_position": "ABSENT",
+            "verified_email": verified_email,
             "is_catchall": False,
             "linkedin": "ABSENT",
             "instagram": "ABSENT",
             "facebook": "ABSENT",
-            "phone": enrichment.get("phone", "ABSENT"),
+            "phone": phone,
             "aggregator_source": aggregator_source,
             "aggregator_url": aggregator_url,
+            "aggregator_rating": aggregator_rating,
+            "needs_website": True,  # Always true for this engine
             "validation_gates_passed": gates_passed,
         }
 
@@ -249,100 +379,74 @@ async def run_web_absent(
             print(f"[WEB_ABSENT] Footprint failed for {company_name} — DROPPED")
             continue
 
-        # Gate 2: SMTP (Starter+)
+        # Gate 2: SMTP (Starter/Growth/Pro)
         if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
-            smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
-            lead["is_catchall"] = is_catchall
-            if not smtp_ok and not is_catchall:
-                print(f"[WEB_ABSENT] SMTP failed for {lead['verified_email']} — DROPPED")
-                continue
-            gates_passed = 2
-            lead["validation_gates_passed"] = gates_passed
+            try:
+                smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
+                lead["is_catchall"] = is_catchall
+                if not smtp_ok and not is_catchall:
+                    print(f"[WEB_ABSENT] SMTP failed for {lead['verified_email']} — DROPPED")
+                    continue
+                gates_passed = 2
+                lead["validation_gates_passed"] = gates_passed
+            except Exception as e:
+                print(f"[WEB_ABSENT] SMTP error for {lead['verified_email']}: {e} — lenient accept")
+                gates_passed = 2
+                lead["validation_gates_passed"] = gates_passed
 
         # Gate 3: DeepSeek AI (Pro only)
         if user_tier == "pro" and lead["verified_email"] != "ABSENT":
-            deepseek_ok, is_role, reason = await check_deepseek(lead["verified_email"], company_name)
-            if not deepseek_ok:
-                print(f"[WEB_ABSENT] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
-                continue
-            if is_role:
-                lead["is_catchall"] = True
-            gates_passed = 3
-            lead["validation_gates_passed"] = gates_passed
+            try:
+                deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
+                if not deepseek_ok:
+                    print(f"[WEB_ABSENT] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
+                    continue
+                if is_role:
+                    lead["is_catchall"] = True
+                gates_passed = 3
+                lead["validation_gates_passed"] = gates_passed
+            except Exception as e:
+                print(f"[WEB_ABSENT] DeepSeek Gate 3 error for {lead['verified_email']}: {e} — lenient accept")
+                gates_passed = 3
+                lead["validation_gates_passed"] = gates_passed
 
         leads.append(lead)
+
+    if progress_callback:
+        await progress_callback(90, f"Found {len(leads)} verified businesses without websites")
 
     print(f"[WEB_ABSENT] Returning {len(leads)} verified leads")
     return leads
 
 
-async def _enrich_aggregator_lead(
-    company_name: str,
-    aggregator_source: str,
-    aggregator_url: str,
-    user_tier: str,
-) -> Dict[str, str]:
-    """Enrich an aggregator-listed business with contact details."""
-    scraped_profile_text = ""
-
-    if aggregator_url and aggregator_url != "ABSENT":
-        print(f"[WEB_ABSENT] Fetching aggregator profile {aggregator_url}")
-        profile_result = await stealth_fetch(aggregator_url, timeout=15)
-        if profile_result:
-            scraped_profile_text = extract_text_from_html(profile_result["html"], max_chars=8000)
-
-    if scraped_profile_text:
-        prompt = f"""
-        You are a business researcher. Below is REAL TEXT scraped from the {aggregator_source} profile page of:
-        "{company_name}" at {aggregator_url}
-
-        This business does NOT have its own website. Extract contact details from the scraped profile text:
-        - dm_name: Full name of the owner or manager
-        - dm_position: Their job title
-        - verified_email: Any email address listed (from the aggregator profile)
-        - phone: Phone number listed on the profile
-
-        SCRAPED PROFILE CONTENT:
-        {scraped_profile_text[:8000]}
-
-        Only extract information that is clearly present in the scraped text.
-        If you cannot find any piece of information, write "ABSENT".
-        Return a single JSON object.
-        """
-    else:
-        prompt = f"""
-        You are a business researcher. Find contact details for this business:
-        "{company_name}" listed on {aggregator_source} at {aggregator_url}
-
-        This business does NOT have its own website. Look for:
-        - dm_name: Full name of the owner or manager
-        - dm_position: Their job title
-        - verified_email: Any email address listed (from the aggregator profile)
-        - phone: Phone number listed on the profile
-
-        If you cannot find any piece of information, write "ABSENT".
-        Return a single JSON object.
-        """
-
+# ============================================================
+# HELPERS
+# ============================================================
+def _safe_float(value: Any) -> float:
+    """Convert a value to a float, returning 0.0 on failure."""
     try:
-        response = await execute_llm_payload({
-            "model": DEEPSEEK_SCOUT_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a precise data extractor. Only extract information from the provided text when available. Never invent data. Always respond with valid JSON. Use 'ABSENT' for missing data."},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        })
+        if value is None or value == "" or value == "ABSENT":
+            return 0.0
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
 
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        return json.loads(content)
 
-    except Exception as e:
-        print(f"[WEB_ABSENT] Enrichment error for {company_name}: {e}")
-        return {
-            "dm_name": "ABSENT",
-            "dm_position": "ABSENT",
-            "verified_email": "ABSENT",
-            "phone": "ABSENT",
-        }
+def _looks_like_external_domain(name: str, external_links: set) -> bool:
+    """Detect if a company_name string is actually a standalone external domain."""
+    if not name:
+        return False
+    name_lower = name.lower().strip()
+    # Patterns like "abcroofing.com" without aggregator suffix
+    if " " not in name_lower and "." in name_lower and not any(
+        agg in name_lower for agg in AGGREGATOR_DOMAINS
+    ):
+        # Looks like a domain — does it match any external link we found?
+        for link in external_links:
+            try:
+                host = (urlparse(link).netloc or "").lower()
+                if host and host in name_lower:
+                    return True
+            except Exception:
+                pass
+    return False
