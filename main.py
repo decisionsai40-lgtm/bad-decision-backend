@@ -716,6 +716,90 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
 
 
 # ============================================================
+# BATCH OUTREACH MESSAGE GENERATION
+# ============================================================
+class BatchOutreachRequest(BaseModel):
+    task_id: str = Field(..., min_length=1, max_length=256)
+
+
+@app.post("/api/outreach/generate-batch")
+async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optional[str] = Header(None)):
+    """
+    Generate outreach messages for ALL leads in a task (collection).
+    Called when the user clicks 'Generate for All Leads' in the results view.
+    Processes leads sequentially (to avoid DeepSeek rate limits) and returns
+    the count of successfully generated messages.
+    """
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    from ai.outreach_generator import generate_outreach_messages
+    db = get_supabase()
+
+    # 1. Fetch all leads for this task
+    leads_result = (
+        db.table("workspace_leads")
+        .select("*")
+        .eq("task_id", req.task_id)
+        .execute()
+    )
+    if not leads_result.data:
+        raise HTTPException(status_code=404, detail="No leads found for this task.")
+
+    leads = leads_result.data
+    if not leads:
+        raise HTTPException(status_code=404, detail="No leads found.")
+
+    # 2. Fetch user settings
+    user_id = leads[0].get("user_id")
+    profile_result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_result.data or not profile_result.data[0].get("user_service"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please set up your service in Settings first."
+        )
+
+    user_settings = profile_result.data[0]
+    user_service = user_settings.get("user_service", "")
+    target_audience = user_settings.get("target_audience", "")
+    copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+
+    # 3. Generate outreach for each lead
+    success_count = 0
+    for lead in leads:
+        # Skip if already has messages
+        if lead.get("outreach_email") and lead.get("outreach_email") != "ABSENT":
+            success_count += 1
+            continue
+
+        try:
+            outreach = await generate_outreach_messages(
+                lead, user_service, target_audience, copywriting_style
+            )
+            db.table("workspace_leads").update({
+                "outreach_email": outreach.get("email_message", "ABSENT"),
+                "outreach_social": outreach.get("social_message", "ABSENT"),
+                "outreach_call": outreach.get("call_script", "ABSENT"),
+            }).eq("id", lead["id"]).execute()
+            success_count += 1
+        except Exception as e:
+            print(f"[OUTREACH-BATCH] Error for lead {lead.get('id')}: {e}")
+
+    return {
+        "success": True,
+        "total_leads": len(leads),
+        "generated": success_count,
+        "message": f"Generated outreach messages for {success_count} out of {len(leads)} leads."
+    }
+
+
+# ============================================================
 # COLLECTIONS ENDPOINT
 # ============================================================
 @app.get("/api/collections/{user_id}")

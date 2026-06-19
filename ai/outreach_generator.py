@@ -102,28 +102,30 @@ LEAD INFORMATION:
 {lead_context}
 
 Generate 3 outreach messages for this lead. Each message must be:
-- Maximum 150 characters (this is a hard limit)
+- Between 140 and 160 characters (aim for 150 — not too short, not too long)
 - Grade 3 English (simple words a 10-year-old can read)
 - No spam trigger words (avoid: free, guarantee, click here, act now, limited time, etc.)
 - Highly personalized to THIS specific business based on the info above
 - Friendly and human-sounding (not robotic)
+- Sound like a real person wrote it, not a template
+- Reference something SPECIFIC about this business (their name, location, what they do, their rating, etc.)
 
 Generate these 3 messages:
 
-1. email_message: A short email opener. Address them by name if known. Reference something specific about their business. End with a simple question.
+1. email_message: A personalized email opener. Start with their name if known. Mention something specific about their business. Connect it to what the user offers. End with a simple question that invites a reply. Target: 140-160 characters.
 
-2. social_message: A short DM or comment for social media. Casual tone. Reference their post or profile. End with a question.
+2. social_message: A casual DM or comment for social media. Friendly tone. Reference their post or profile if available. Keep it conversational. End with a question. Target: 140-160 characters.
 
-3. call_script: A short cold call opener. Who you are, why you're calling (tied to their business), and a question to start the conversation.
+3. call_script: A cold call opener. Say who you are briefly. Mention why you're calling (tied to their specific business). End with an engaging question. Target: 140-160 characters.
 
 Return a JSON object:
 {{
-    "email_message": "the message (max 150 chars)",
-    "social_message": "the message (max 150 chars)",
-    "call_script": "the message (max 150 chars)"
+    "email_message": "the message (140-160 chars)",
+    "social_message": "the message (140-160 chars)",
+    "call_script": "the message (140-160 chars)"
 }}
 
-CRITICAL: Each message MUST be 150 characters or less. Count carefully.
+CRITICAL: Each message MUST be between 140 and 160 characters. Not shorter. Not longer. Count carefully before responding.
 """
 
     return prompt
@@ -138,7 +140,7 @@ def _check_spam_words(message: str) -> bool:
     return False
 
 
-def _truncate_message(message: str, max_chars: int = 150) -> str:
+def _truncate_message(message: str, max_chars: int = 160) -> str:
     """Truncate a message to max_chars, cutting at the last space before the limit."""
     if len(message) <= max_chars:
         return message
@@ -146,7 +148,7 @@ def _truncate_message(message: str, max_chars: int = 150) -> str:
     # Cut at the last space before the limit
     truncated = message[:max_chars]
     last_space = truncated.rfind(" ")
-    if last_space > 50:  # Don't cut too short
+    if last_space > 100:  # Don't cut too short
         truncated = truncated[:last_space]
 
     return truncated.rstrip(".,!?;:") + "..."
