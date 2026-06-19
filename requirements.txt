@@ -8,4 +8,5 @@ httpx==0.27.2
 supabase==2.7.4
 scrapling[fetchers]==0.4.8
 dnspython==2.6.1
-selectolax==0.3.21
+# selectolax is optional — code falls back to regex if not installed
+# Install manually on Render if available: pip install selectolax
