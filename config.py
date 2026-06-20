@@ -10,9 +10,23 @@ load_dotenv()
 # ============================================================
 # SUPABASE
 # ============================================================
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+def _clean_env(val: str) -> str:
+    """Aggressively clean env var values — remove ALL hidden characters."""
+    if not val:
+        return ""
+    # Remove ALL control characters, null bytes, carriage returns, newlines, tabs
+    # that might be embedded anywhere in the string
+    import re
+    val = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', val)
+    # Strip whitespace from both ends
+    val = val.strip()
+    # Remove any remaining non-printable characters
+    val = ''.join(c for c in val if c.isprintable())
+    return val
+
+SUPABASE_URL = _clean_env(os.getenv("SUPABASE_URL", ""))
+SUPABASE_KEY = _clean_env(os.getenv("SUPABASE_KEY", ""))
+SUPABASE_ANON_KEY = _clean_env(os.getenv("SUPABASE_ANON_KEY", ""))
 
 # ============================================================
 # BACKEND API SECRET + CORS
