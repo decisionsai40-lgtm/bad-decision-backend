@@ -173,7 +173,8 @@ def health_check():
     """Detailed health check including database connectivity."""
     # Debug: show what SUPABASE_URL looks like
     from config import SUPABASE_URL, SUPABASE_KEY
-    url_debug = f"len={len(SUPABASE_URL)} starts_https={SUPABASE_URL.startswith('https://')} ends_supabase={SUPABASE_URL.endswith('.co')} first20={SUPABASE_URL[:20]!r} last10={SUPABASE_URL[-10:]!r}"
+    url_chars = [f"{i}:{c}({ord(c)})" for i, c in enumerate(SUPABASE_URL)]
+    url_debug = f"len={len(SUPABASE_URL)} chars={'|'.join(url_chars)}"
     key_debug = f"len={len(SUPABASE_KEY)} starts_eyJ={SUPABASE_KEY.startswith('eyJ')}"
 
     try:
