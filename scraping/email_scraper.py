@@ -32,14 +32,18 @@ MAILTO_REGEX = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]
 
 
 def extract_domain(website_url: str) -> str:
-    """Extract the domain from a URL."""
+    """Extract the domain from a URL, stripping the 'www.' prefix."""
     if not website_url or website_url == "ABSENT":
         return ""
     try:
         if not website_url.startswith("http"):
             website_url = "https://" + website_url
         parsed = urlparse(website_url)
-        return parsed.hostname or ""
+        hostname = parsed.hostname or ""
+        # Strip leading www. so we generate info@teamjustice.com, not info@www.teamjustice.com
+        if hostname.lower().startswith("www."):
+            hostname = hostname[4:]
+        return hostname.lower()
     except:
         return ""
 

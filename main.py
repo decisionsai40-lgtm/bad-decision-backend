@@ -453,30 +453,81 @@ async def get_task_leads(
     x_api_secret: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
 ):
-    """Get all leads for a specific task."""
+    """
+    Get all leads for a specific task.
+
+    ROBUST LOOKUP:
+    - First tries tasks.id = task_id (the normal case).
+    - If that fails, checks if task_id is actually a smart_collections.id
+      (the frontend may pass the collection UUID when the collection's
+      task_id FK is NULL or when older collections predate the FK).
+      In that case, uses smart_collections.task_id to find the real task.
+    - If neither works, returns 404.
+    """
     verify_api_secret(x_api_secret)
 
     from supabase_client import get_supabase
     db = get_supabase()
 
-    # Verify the task belongs to the user
-    if x_user_id:
-        task_result = (
-            db.table("tasks")
-            .select("user_id")
+    real_task_id = task_id
+    task_owner = None
+
+    # 1. Try the tasks table directly
+    task_result = (
+        db.table("tasks")
+        .select("id, user_id")
+        .eq("id", task_id)
+        .limit(1)
+        .execute()
+    )
+    if task_result.data:
+        real_task_id = task_result.data[0]["id"]
+        task_owner = task_result.data[0].get("user_id")
+    else:
+        # 2. Fallback: maybe task_id is actually a smart_collections.id
+        col_result = (
+            db.table("smart_collections")
+            .select("id, task_id, user_id")
             .eq("id", task_id)
             .limit(1)
             .execute()
         )
-        if not task_result.data:
+        if col_result.data:
+            col = col_result.data[0]
+            col_task_id = col.get("task_id")
+            col_user_id = col.get("user_id")
+            if col_task_id:
+                # Verify the underlying task exists
+                verify_task = (
+                    db.table("tasks")
+                    .select("id, user_id")
+                    .eq("id", col_task_id)
+                    .limit(1)
+                    .execute()
+                )
+                if verify_task.data:
+                    real_task_id = verify_task.data[0]["id"]
+                    task_owner = verify_task.data[0].get("user_id")
+                else:
+                    # Collection points to a task that no longer exists
+                    raise HTTPException(status_code=404, detail="The task for this collection no longer exists.")
+            else:
+                # Collection has no task_id — orphaned collection
+                # Use the collection's user_id for ownership but we can't fetch leads
+                task_owner = col_user_id
+                return {"leads": [], "task_id": task_id, "orphaned": True}
+        else:
             raise HTTPException(status_code=404, detail="Task not found")
-        if task_result.data[0].get("user_id") != x_user_id:
-            raise HTTPException(status_code=403, detail="Access denied: this task belongs to another user.")
 
+    # 3. Ownership check
+    if x_user_id and task_owner and task_owner != x_user_id:
+        raise HTTPException(status_code=403, detail="Access denied: this task belongs to another user.")
+
+    # 4. Fetch leads
     result = (
         db.table("workspace_leads")
         .select("*")
-        .eq("task_id", task_id)
+        .eq("task_id", real_task_id)
         .order("created_at", desc=False)
         .execute()
     )
@@ -832,6 +883,217 @@ async def get_user_collections(
         .execute()
     )
     return {"collections": result.data}
+
+
+# ============================================================
+# USER SETTINGS ENDPOINTS (for outreach message personalization)
+# ============================================================
+class UpdateSettingsRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=256)
+    user_service: str = Field(default="", max_length=500)
+    target_audience: str = Field(default="", max_length=500)
+    copywriting_style: str = Field(default="david_ogilvy", pattern=r"^(dan_kennedy|donald_miller|ray_edwards|david_ogilvy|jay_abraham|gary_halbert)$")
+
+
+@app.put("/api/settings/{user_id}")
+async def update_user_settings(user_id: str, req: UpdateSettingsRequest, x_api_secret: Optional[str] = Header(None)):
+    """Update user settings (service, audience, copywriting style) for outreach messages."""
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = db.table("profiles").update({
+        "user_service": req.user_service,
+        "target_audience": req.target_audience,
+        "copywriting_style": req.copywriting_style,
+        "updated_at": "now()",
+    }).eq("id", user_id).execute()
+
+    return {"success": True, "settings": result.data[0] if result.data else None}
+
+
+@app.get("/api/settings/{user_id}")
+async def get_user_settings(user_id: str, x_api_secret: Optional[str] = Header(None)):
+    """Get user settings for outreach messages."""
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return {"settings": {"user_service": "", "target_audience": "", "copywriting_style": "david_ogilvy"}}
+    return {"settings": result.data[0]}
+
+
+# ============================================================
+# OUTREACH MESSAGE GENERATION (on-demand, per-lead)
+# ============================================================
+class OutreachRequest(BaseModel):
+    lead_id: str = Field(..., min_length=1, max_length=256)
+
+
+@app.post("/api/outreach/generate")
+async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = Header(None)):
+    """
+    Generate personalized outreach messages for a single lead on demand.
+    The user clicks 'Generate Messages' on a lead card, and this endpoint
+    fetches the lead, fetches the user's settings, generates 3 messages,
+    saves them to the database, and returns them.
+
+    Each message (email/social/call) is strictly enforced to 500-530 characters.
+    """
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    from ai.outreach_generator import generate_outreach_messages
+    db = get_supabase()
+
+    # 1. Fetch the lead
+    lead_result = (
+        db.table("workspace_leads")
+        .select("*")
+        .eq("id", req.lead_id)
+        .limit(1)
+        .execute()
+    )
+    if not lead_result.data:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead = lead_result.data[0]
+    user_id = lead.get("user_id")
+
+    # 2. Fetch the user's settings
+    profile_result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_result.data or not profile_result.data[0].get("user_service"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please set up your service in Settings first."
+        )
+
+    user_settings = profile_result.data[0]
+    user_service = user_settings.get("user_service", "")
+    target_audience = user_settings.get("target_audience", "")
+    copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+
+    # 3. Generate the outreach messages (with strict 500-530 char enforcement)
+    try:
+        outreach = await generate_outreach_messages(
+            lead, user_service, target_audience, copywriting_style
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate messages: {str(e)}")
+
+    # 4. Save the messages to the database
+    db.table("workspace_leads").update({
+        "outreach_email": outreach.get("email_message", "ABSENT"),
+        "outreach_social": outreach.get("social_message", "ABSENT"),
+        "outreach_call": outreach.get("call_script", "ABSENT"),
+    }).eq("id", req.lead_id).execute()
+
+    return {
+        "success": True,
+        "outreach_email": outreach.get("email_message", "ABSENT"),
+        "outreach_social": outreach.get("social_message", "ABSENT"),
+        "outreach_call": outreach.get("call_script", "ABSENT"),
+    }
+
+
+# ============================================================
+# BATCH OUTREACH MESSAGE GENERATION
+# ============================================================
+class BatchOutreachRequest(BaseModel):
+    task_id: str = Field(..., min_length=1, max_length=256)
+
+
+@app.post("/api/outreach/generate-batch")
+async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optional[str] = Header(None)):
+    """
+    Generate outreach messages for ALL leads in a task (collection).
+    Called when the user clicks 'Write Messages for All' in the results view.
+    Processes leads sequentially (to avoid DeepSeek rate limits) and returns
+    the count of successfully generated messages.
+
+    Each message is strictly enforced to 500-530 characters.
+    """
+    verify_api_secret(x_api_secret)
+
+    from supabase_client import get_supabase
+    from ai.outreach_generator import generate_outreach_messages
+    db = get_supabase()
+
+    # 1. Fetch all leads for this task
+    leads_result = (
+        db.table("workspace_leads")
+        .select("*")
+        .eq("task_id", req.task_id)
+        .execute()
+    )
+    if not leads_result.data:
+        raise HTTPException(status_code=404, detail="No leads found for this task.")
+
+    leads = leads_result.data
+    if not leads:
+        raise HTTPException(status_code=404, detail="No leads found.")
+
+    # 2. Fetch user settings
+    user_id = leads[0].get("user_id")
+    profile_result = (
+        db.table("profiles")
+        .select("user_service, target_audience, copywriting_style")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_result.data or not profile_result.data[0].get("user_service"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please set up your service in Settings first."
+        )
+
+    user_settings = profile_result.data[0]
+    user_service = user_settings.get("user_service", "")
+    target_audience = user_settings.get("target_audience", "")
+    copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+
+    # 3. Generate outreach for each lead
+    success_count = 0
+    for lead in leads:
+        # Skip if already has messages
+        if lead.get("outreach_email") and lead.get("outreach_email") != "ABSENT":
+            success_count += 1
+            continue
+
+        try:
+            outreach = await generate_outreach_messages(
+                lead, user_service, target_audience, copywriting_style
+            )
+            db.table("workspace_leads").update({
+                "outreach_email": outreach.get("email_message", "ABSENT"),
+                "outreach_social": outreach.get("social_message", "ABSENT"),
+                "outreach_call": outreach.get("call_script", "ABSENT"),
+            }).eq("id", lead["id"]).execute()
+            success_count += 1
+        except Exception as e:
+            print(f"[OUTREACH-BATCH] Error for lead {lead.get('id')}: {e}")
+
+    return {
+        "success": True,
+        "total_leads": len(leads),
+        "generated": success_count,
+        "message": f"Generated outreach messages for {success_count} out of {len(leads)} leads."
+    }
 
 
 # ============================================================
