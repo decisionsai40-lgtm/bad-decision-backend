@@ -171,6 +171,11 @@ def root():
 @app.get("/health")
 def health_check():
     """Detailed health check including database connectivity."""
+    # Debug: show what SUPABASE_URL looks like
+    from config import SUPABASE_URL, SUPABASE_KEY
+    url_debug = f"len={len(SUPABASE_URL)} starts_https={SUPABASE_URL.startswith('https://')} ends_supabase={SUPABASE_URL.endswith('.co')} first20={SUPABASE_URL[:20]!r} last10={SUPABASE_URL[-10:]!r}"
+    key_debug = f"len={len(SUPABASE_KEY)} starts_eyJ={SUPABASE_KEY.startswith('eyJ')}"
+
     try:
         from supabase_client import get_supabase
         db = get_supabase()
@@ -184,6 +189,8 @@ def health_check():
         "database": db_status,
         "version": "3.0.0",
         "auth_enforced": bool(BACKEND_API_SECRET),
+        "debug_supabase_url": url_debug,
+        "debug_supabase_key": key_debug,
     }
 
 
