@@ -760,12 +760,24 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
         raise HTTPException(status_code=500, detail=f"Could not generate messages: {str(e)}")
 
     # 4. Save the messages to the database
-    db.table("workspace_leads").update({
-        "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
+    # Try with outreach_email_subject first; if the column doesn't exist yet
+    # (migration not run), fall back to saving without it.
+    update_data = {
         "outreach_email": outreach.get("email_message", "ABSENT"),
         "outreach_social": outreach.get("social_message", "ABSENT"),
         "outreach_call": outreach.get("call_script", "ABSENT"),
-    }).eq("id", req.lead_id).execute()
+    }
+    try:
+        update_data["outreach_email_subject"] = outreach.get("email_subject", "ABSENT")
+        db.table("workspace_leads").update(update_data).eq("id", req.lead_id).execute()
+    except Exception as col_err:
+        # Column might not exist — try without outreach_email_subject
+        print(f"[OUTREACH] Could not save with email_subject column (migration not run?): {col_err}")
+        update_data.pop("outreach_email_subject", None)
+        try:
+            db.table("workspace_leads").update(update_data).eq("id", req.lead_id).execute()
+        except Exception as save_err:
+            print(f"[OUTREACH] Could not save messages: {save_err}")
 
     return {
         "success": True,
@@ -859,11 +871,17 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
                 lead, user_service, target_audience, copywriting_style
             )
             db.table("workspace_leads").update({
-                "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
                 "outreach_email": outreach.get("email_message", "ABSENT"),
                 "outreach_social": outreach.get("social_message", "ABSENT"),
                 "outreach_call": outreach.get("call_script", "ABSENT"),
             }).eq("id", lead["id"]).execute()
+            # Try to save email_subject too (separate in case column doesn't exist)
+            try:
+                db.table("workspace_leads").update({
+                    "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
+                }).eq("id", lead["id"]).execute()
+            except Exception:
+                pass  # Column might not exist yet — that's OK
             success_count += 1
         except Exception as e:
             print(f"[OUTREACH-BATCH] Error for lead {lead.get('id')}: {e}")
