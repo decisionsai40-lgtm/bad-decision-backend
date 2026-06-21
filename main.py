@@ -779,15 +779,24 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
 # ============================================================
 class BatchOutreachRequest(BaseModel):
     task_id: str = Field(..., min_length=1, max_length=256)
+    force_regenerate: bool = Field(default=False)
 
 
 @app.post("/api/outreach/generate-batch")
 async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optional[str] = Header(None)):
     """
     Generate outreach messages for ALL leads in a task (collection).
-    Called when the user clicks 'Generate for All Leads' in the results view.
+    Called when the user clicks 'Write Messages for All' in the results view.
     Processes leads sequentially (to avoid DeepSeek rate limits) and returns
     the count of successfully generated messages.
+
+    force_regenerate:
+      - False (default): SKIP leads that already have outreach_email set.
+        Only generates for leads with no messages yet.
+      - True: OVERRIDE existing messages — regenerate for ALL leads,
+        even those that already have messages.
+
+    Each message is strictly enforced to 500-530 characters.
     """
     verify_api_secret(x_api_secret)
 
@@ -831,10 +840,16 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
 
     # 3. Generate outreach for each lead
     success_count = 0
+    skipped_count = 0
     for lead in leads:
-        # Skip if already has messages
-        if lead.get("outreach_email") and lead.get("outreach_email") != "ABSENT":
-            success_count += 1
+        has_existing = (
+            lead.get("outreach_email")
+            and lead.get("outreach_email") != "ABSENT"
+        )
+
+        # Skip leads that already have messages UNLESS force_regenerate is True
+        if has_existing and not req.force_regenerate:
+            skipped_count += 1
             continue
 
         try:
@@ -850,11 +865,15 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
         except Exception as e:
             print(f"[OUTREACH-BATCH] Error for lead {lead.get('id')}: {e}")
 
+    action_word = "Regenerated" if req.force_regenerate else "Generated"
     return {
         "success": True,
         "total_leads": len(leads),
         "generated": success_count,
-        "message": f"Generated outreach messages for {success_count} out of {len(leads)} leads."
+        "skipped": skipped_count,
+        "force_regenerate": req.force_regenerate,
+        "message": f"{action_word} outreach messages for {success_count} out of {len(leads)} leads."
+                   + (f" ({skipped_count} already had messages and were skipped.)" if skipped_count > 0 else "")
     }
 
 
