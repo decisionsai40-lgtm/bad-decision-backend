@@ -579,6 +579,9 @@ async def get_credit_balance(
     monthly renewal for free-tier users. This is the canonical place
     that expiry is enforced — every time the dashboard loads, we check
     if the user's free credits have expired and renew them if so.
+
+    Returns the balance PLUS a summary of credit lots (for the dashboard
+    "X credits (Y expiring soon)" display).
     """
     verify_api_secret(x_api_secret)
 
@@ -589,8 +592,6 @@ async def get_credit_balance(
     db = get_supabase()
 
     # Renew free credits if expired (30-day cycle for free-tier users).
-    # Safe to call on every request — the RPC is idempotent and only
-    # modifies the row if expiry has actually passed.
     try:
         db.rpc("renew_free_credits", {"p_user_id": user_id}).execute()
     except Exception as e:
@@ -609,16 +610,48 @@ async def get_credit_balance(
                 "credits_balance": 0,
                 "credits_reserved": 0,
                 "total_purchased": 0,
+                "lots": [],
+                "expiring_soon": 0,
             }
         }
     row = result.data[0]
+
+    # Fetch lot summary for the dashboard
+    lots = []
+    expiring_soon = 0
+    try:
+        from credit_lots import get_user_lots_summary, get_expiring_soon_count
+        lots = await get_user_lots_summary(user_id)
+        expiring_soon = await get_expiring_soon_count(user_id, days=7)
+    except Exception as e:
+        print(f"[API] Warning: could not fetch lot summary: {e}")
+
     return {
         "balance": {
             "credits_balance": row["credits_balance"],
             "credits_reserved": row["credits_reserved"],
             "total_purchased": row["total_purchased"],
+            "lots": lots,
+            "expiring_soon": expiring_soon,
         }
     }
+
+
+@app.get("/api/credits/lots/{user_id}")
+async def get_credit_lots(
+    user_id: str,
+    x_api_secret: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Get a user's credit lot breakdown (for the dashboard tooltip)."""
+    verify_api_secret(x_api_secret)
+
+    if x_user_id and user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    from credit_lots import get_user_lots_summary
+    lots = await get_user_lots_summary(user_id)
+    return {"lots": lots}
 
 
 @app.get("/api/credits/transactions/{user_id}")
@@ -1037,6 +1070,31 @@ async def get_user_collections(
         .execute()
     )
     return {"collections": result.data}
+
+
+# ============================================================
+# CRON ENDPOINT — Credit Expiry Sweep
+# ============================================================
+# Called hourly by Cloud Scheduler (Phase D) or manually.
+# Triggers the expire_credits_cron RPC which:
+#   1. Finds all users with expired lots
+#   2. Deducts expired credits from their balance
+#   3. Deletes expired lots
+#   4. Triggers renew_free_credits for free-tier users
+@app.post("/api/cron/expire-credits")
+async def expire_credits_cron_endpoint(x_api_secret: Optional[str] = Header(None)):
+    """Hourly cron — expire credits and trigger free-tier renewal."""
+    verify_api_secret(x_api_secret)
+    from supabase_client import get_supabase
+    db = get_supabase()
+    try:
+        result = db.rpc("expire_credits_cron").execute()
+        expired_users = result.data if result.data is not None else 0
+        print(f"[CRON] Expired credits for {expired_users} users")
+        return {"success": True, "expired_users": expired_users}
+    except Exception as e:
+        print(f"[CRON] expire_credits_cron failed: {e}")
+        return {"success": False, "error": str(e)}
 
 
 # ============================================================

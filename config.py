@@ -84,15 +84,27 @@ OSM_OVERPASS_ENDPOINT = os.getenv("OSM_OVERPASS_ENDPOINT", "https://overpass-api
 # ============================================================
 # CREDIT ECONOMY
 # ============================================================
-CREDIT_COST_SCAN = 1       # Free tier: 1 credit per lead
+# Per-action credit costs (Phase B pricing overhaul)
+CREDIT_COST_SCAN = 1       # Free tier: 1 credit per lead (smb_maps only)
 CREDIT_COST_DEEP = 2       # Starter/Growth: 2 credits per lead
-CREDIT_COST_SMTP = 3       # Pro: 3 credits per lead
-CREDIT_FREE_TRIAL = 100
+CREDIT_COST_SMTP = 3       # Pro: 3 credits per lead (includes DeepSeek Gate 3)
+CREDIT_COST_MSG_GEN_SINGLE = 3   # Single-lead outreach message generation (4 messages)
+CREDIT_COST_MSG_GEN_BATCH = 2    # Batch mode per-lead (skip_regeneration=True)
+CREDIT_COST_REGENERATE = 2       # Regenerate a single message
+CREDIT_COST_EMAIL_SEND = 1       # Per 5 emails sent (0.2 credits per email)
+CREDIT_COST_AI_TURN = 2          # AI Agent conversation turn (Phase F)
+
+# Free tier
+CREDIT_FREE_TRIAL = 50            # Was 100 — reduced to drive paid conversion
+CREDIT_FREE_RENEWAL_DAYS = 30     # Free credits expire/renew every 30 days
+CREDIT_PAID_EXPIRY_DAYS = 60      # Paid credits expire 60 days after purchase
 
 # Lead targets — credit-aware (engine will check user balance)
-LEAD_TARGET_FREE = 50      # Free tier cap
-LEAD_TARGET_PAID = 150     # Paid tier cap (target 100+ after filtering)
-MIN_LEADS_WARNING = 10     # Show warning if user can't afford this many
+LEAD_TARGET_FREE = 25       # Free tier cap (was 50 — reduced for free tier)
+LEAD_TARGET_STARTER = 50    # Starter tier cap
+LEAD_TARGET_GROWTH = 75     # Growth tier cap
+LEAD_TARGET_PAID = 100      # Pro tier cap
+MIN_LEADS_WARNING = 10      # Show warning if user can't afford this many
 
 # ============================================================
 # CACHE FRESHNESS

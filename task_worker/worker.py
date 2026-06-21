@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 from supabase_client import get_supabase
 from config import (
     TASK_POLL_INTERVAL, TASK_BATCH_SIZE, MAX_CONCURRENT_TASKS,
-    LEAD_TARGET_FREE, LEAD_TARGET_PAID,
+    LEAD_TARGET_FREE, LEAD_TARGET_STARTER, LEAD_TARGET_GROWTH, LEAD_TARGET_PAID,
     CREDIT_COST_SCAN, CREDIT_COST_DEEP, CREDIT_COST_SMTP,
 )
 from engines import ENGINE_MAP
@@ -96,8 +96,14 @@ async def _process_task(task: Dict[str, Any]):
         credits_per_lead = _get_credit_cost(user_tier)
         max_leads_by_credits = credits_reserved // credits_per_lead if credits_per_lead > 0 else 50
 
-        # Cap at tier limits
-        tier_cap = LEAD_TARGET_PAID if user_tier != "free" else LEAD_TARGET_FREE
+        # Cap at tier-specific limits
+        tier_caps = {
+            "free": LEAD_TARGET_FREE,       # 25
+            "starter": LEAD_TARGET_STARTER,  # 50
+            "growth": LEAD_TARGET_GROWTH,    # 75
+            "pro": LEAD_TARGET_PAID,         # 100
+        }
+        tier_cap = tier_caps.get(user_tier, LEAD_TARGET_FREE)
         lead_target = min(max_leads_by_credits, tier_cap)
 
         # Don't allow less than 5 (even if credits are low)
@@ -300,9 +306,14 @@ async def _update_task_status(task_id: str, status: str):
 
 
 async def _commit_credits(user_id: str, amount: int, description: str):
+    """Commit reserved credits (deduct from credits_reserved) AND
+    deduct from credit_lots via FIFO so the lot tracking stays accurate."""
     try:
         db = get_supabase()
         db.rpc("commit_credits", {"p_user_id": user_id, "p_amount": amount, "p_description": description}).execute()
+        # Also deduct from lots (FIFO) so expiry tracking is correct
+        from credit_lots import deduct_credits_fifo
+        await deduct_credits_fifo(user_id, amount, f"Search completed: {description}")
     except Exception as e:
         print(f"[WORKER] Error committing credits: {e}")
 

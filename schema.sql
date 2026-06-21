@@ -100,6 +100,30 @@ CREATE INDEX idx_credit_tx_user_id ON credit_transactions (user_id);
 CREATE INDEX idx_credit_tx_created ON credit_transactions (created_at DESC);
 
 -- ============================================================
+-- 3b. CREDIT LOTS TABLE (NEW — lot-based expiry tracking)
+-- ============================================================
+-- Every credit grant (signup, renewal, purchase) creates a lot.
+-- Each lot tracks its own remaining balance + expiry date.
+-- Spending deducts from the lot with earliest expiry first (FIFO).
+-- Free lots: 30-day expiry, auto-renew (no accumulation).
+-- Paid lots: 60-day hard expiry, no renewal.
+CREATE TABLE credit_lots (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  amount        INTEGER NOT NULL,
+  remaining     INTEGER NOT NULL,
+  source        TEXT NOT NULL,              -- 'signup_bonus' | 'purchase' | 'monthly_renewal' | 'ai_comp' | 'migration'
+  is_free       BOOLEAN DEFAULT FALSE,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  CONSTRAINT remaining_nonnegative CHECK (remaining >= 0),
+  CONSTRAINT remaining_not_exceed_amount CHECK (remaining <= amount)
+);
+
+CREATE INDEX idx_credit_lots_user_expires ON credit_lots (user_id, expires_at);
+CREATE INDEX idx_credit_lots_user_remaining ON credit_lots (user_id, remaining) WHERE remaining > 0;
+
+-- ============================================================
 -- 4. TASKS TABLE
 -- ============================================================
 -- Each row = one search task. user_id = Clerk user ID (TEXT).
@@ -224,15 +248,21 @@ BEGIN
   VALUES (p_clerk_id, p_email, p_full_name, 'free', COALESCE(NULLIF(p_country, ''), 'US'))
   ON CONFLICT (id) DO NOTHING;
 
-  -- Insert credit_balances with 100 free credits + 30-day expiry.
+  -- Insert credit_balances with 50 free credits + 30-day expiry.
   -- total_purchased is 0 because these are free credits, not purchased.
-  -- (total_purchased only increments on real Paystack purchases.)
   INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased, credits_expiry, last_renewed_at)
-  VALUES (p_clerk_id, 100, 0, 0, now() + interval '30 days', now())
+  VALUES (p_clerk_id, 50, 0, 0, now() + interval '30 days', now())
   ON CONFLICT (user_id) DO NOTHING;
 
+  -- Create the credit lot for tracking (idempotent)
+  INSERT INTO credit_lots (user_id, amount, remaining, source, is_free, expires_at)
+  SELECT p_clerk_id, 50, 50, 'signup_bonus', TRUE, now() + interval '30 days'
+  WHERE NOT EXISTS (
+    SELECT 1 FROM credit_lots WHERE user_id = p_clerk_id
+  );
+
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-  SELECT p_clerk_id, 100, 'signup_bonus', '100 free credits for signing up', 'signup_' || p_clerk_id
+  SELECT p_clerk_id, 50, 'signup_bonus', '50 free credits for signing up', 'signup_' || p_clerk_id
   WHERE NOT EXISTS (
     SELECT 1 FROM credit_transactions
     WHERE reference_id = 'signup_' || p_clerk_id
@@ -379,14 +409,13 @@ BEGIN
     END IF;
   END IF;
 
-  -- Add credits to balance + set expiry to 30 days from now
+  -- Add credits to balance + create a credit lot for paid credits
   UPDATE credit_balances
   SET credits_balance = credits_balance + p_amount,
       total_purchased = CASE
         WHEN p_transaction_type = 'purchase' THEN total_purchased + p_amount
         ELSE total_purchased
       END,
-      credits_expiry = now() + interval '30 days',
       updated_at = now()
   WHERE user_id = p_user_id;
 
@@ -413,8 +442,13 @@ BEGIN
     END;
   END IF;
 
+  -- Create the credit lot (60-day expiry for paid credits)
+  IF p_transaction_type IN ('purchase', 'subscription_grant') THEN
+    INSERT INTO credit_lots (user_id, amount, remaining, source, is_free, expires_at)
+    VALUES (p_user_id, p_amount, p_amount, 'purchase', FALSE, now() + interval '60 days');
+  END IF;
+
   -- Log the transaction (check if already exists to avoid duplicates)
-  -- Using WHERE NOT EXISTS instead of ON CONFLICT for compatibility
   BEGIN
     INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
     SELECT p_user_id, p_amount, p_transaction_type, p_description, p_reference_id
@@ -432,18 +466,19 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 12b. RPC: renew_free_credits (monthly renewal + expiry check)
+-- 12b. RPC: renew_free_credits (monthly renewal + lot cleanup)
 -- ============================================================
 -- Called when a user fetches their credits. Checks if credits have expired
 -- (past credits_expiry date). If expired:
---   - For free users: reset to 50 credits, set new expiry to 30 days from now
---   - For paid users: reset to 0 (they need to buy more)
--- If not expired: do nothing (credits are still valid).
--- If last_renewed_at is more than 30 days ago for free users: renew 50 credits.
+--   - Sums remaining from all expired free lots
+--   - Deducts that from balance
+--   - Deletes expired free lots
+--   - For free-tier users: creates a new 50-credit free lot (30-day expiry)
 CREATE OR REPLACE FUNCTION renew_free_credits(p_user_id TEXT) RETURNS BOOLEAN AS $$
 DECLARE
   cb_record RECORD;
   tier_val TEXT;
+  expired_remaining INTEGER;
 BEGIN
   SELECT cb.*, p.tier INTO cb_record
   FROM credit_balances cb
@@ -459,25 +494,42 @@ BEGIN
 
   -- Check if credits have expired
   IF cb_record.credits_expiry IS NOT NULL AND cb_record.credits_expiry < now() THEN
-    -- Credits have expired. Reset balance to 0.
+    -- Sum remaining from all expired free lots for this user
+    SELECT COALESCE(SUM(remaining), 0) INTO expired_remaining
+    FROM credit_lots
+    WHERE user_id = p_user_id
+      AND is_free = TRUE
+      AND expires_at <= now();
+
+    -- Deduct expired amount from balance (cap at current balance to avoid negative)
     UPDATE credit_balances
-    SET credits_balance = 0,
+    SET credits_balance = GREATEST(credits_balance - expired_remaining, 0),
         credits_expiry = NULL,
         updated_at = now()
     WHERE user_id = p_user_id;
 
-    -- For free tier users, grant 100 new credits with 30-day expiry.
-    -- (Matches the signup bonus in handle_new_user — 100, not 50.)
+    -- Delete expired free lots
+    DELETE FROM credit_lots
+    WHERE user_id = p_user_id
+      AND is_free = TRUE
+      AND expires_at <= now();
+
+    -- For free tier users, grant 50 new credits with 30-day expiry
     IF tier_val = 'free' THEN
       UPDATE credit_balances
-      SET credits_balance = 100,
+      SET credits_balance = 50,
           credits_expiry = now() + interval '30 days',
           last_renewed_at = now(),
           updated_at = now()
       WHERE user_id = p_user_id;
 
+      INSERT INTO credit_lots (user_id, amount, remaining, source, is_free, expires_at)
+      VALUES (p_user_id, 50, 50, 'monthly_renewal', TRUE, now() + interval '30 days');
+
       INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-      SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
+      SELECT p_user_id, 50, 'signup_bonus',
+             'Monthly renewal: 50 free credits',
+             'renew_' || p_user_id || '_' || date_trunc('month', now())::text
       WHERE NOT EXISTS (
         SELECT 1 FROM credit_transactions
         WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
@@ -487,26 +539,76 @@ BEGIN
     RETURN TRUE;
   END IF;
 
-  -- Check if free user hasn't been renewed in 30+ days (even if expiry is NULL)
-  IF tier_val = 'free' AND cb_record.last_renewed_at IS NOT NULL AND cb_record.last_renewed_at < now() - interval '30 days' THEN
-    UPDATE credit_balances
-    SET credits_balance = 100,
-        credits_expiry = now() + interval '30 days',
-        last_renewed_at = now(),
-        updated_at = now()
-    WHERE user_id = p_user_id;
-
-    INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
-    SELECT p_user_id, 100, 'signup_bonus', 'Monthly renewal: 100 free credits', 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
-    WHERE NOT EXISTS (
-      SELECT 1 FROM credit_transactions
-      WHERE reference_id = 'renew_' || p_user_id || '_' || date_trunc('month', now())::text
-    );
-
-    RETURN TRUE;
-  END IF;
-
   RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- 12c. RPC: expire_credits_cron (hourly expiry sweep)
+-- ============================================================
+-- Called hourly by Cloud Scheduler (Phase D) or manually via
+-- /api/cron/expire-credits. Scans for expiring lots across ALL users,
+-- deducts their remaining from balance, and triggers renewal for free-tier users.
+CREATE OR REPLACE FUNCTION expire_credits_cron() RETURNS INTEGER AS $$
+DECLARE
+  expired_count INTEGER := 0;
+  user_record RECORD;
+BEGIN
+  FOR user_record IN
+    SELECT DISTINCT user_id,
+      SUM(remaining) AS total_expired,
+      BOOL_OR(is_free) AS has_free_expired
+    FROM credit_lots
+    WHERE expires_at <= now()
+      AND remaining > 0
+    GROUP BY user_id
+  LOOP
+    UPDATE credit_balances
+    SET credits_balance = GREATEST(credits_balance - user_record.total_expired, 0),
+        updated_at = now()
+    WHERE user_id = user_record.user_id;
+
+    DELETE FROM credit_lots
+    WHERE user_id = user_record.user_id
+      AND expires_at <= now();
+
+    IF user_record.has_free_expired THEN
+      PERFORM renew_free_credits(user_record.user_id);
+    END IF;
+
+    expired_count := expired_count + 1;
+  END LOOP;
+
+  RETURN expired_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- 12d. RPC: get_credit_lots_summary (for dashboard display)
+-- ============================================================
+-- Returns a user's non-expired lots for the dashboard "expiring soon" display.
+CREATE OR REPLACE FUNCTION get_credit_lots_summary(p_user_id TEXT)
+RETURNS JSON AS $$
+DECLARE
+  result JSON;
+BEGIN
+  SELECT COALESCE(json_agg(
+    json_build_object(
+      'id', id,
+      'amount', amount,
+      'remaining', remaining,
+      'source', source,
+      'is_free', is_free,
+      'expires_at', expires_at,
+      'days_until_expiry', EXTRACT(DAY FROM expires_at - now())::INTEGER
+    ) ORDER BY expires_at ASC
+  ), '[]'::json) INTO result
+  FROM credit_lots
+  WHERE user_id = p_user_id
+    AND remaining > 0
+    AND expires_at > now();
+
+  RETURN result;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -532,6 +634,7 @@ $$ LANGUAGE plpgsql;
 -- Enable RLS on all tables
 ALTER TABLE profiles                   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credit_balances            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credit_lots                ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credit_transactions        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tasks                      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE global_intelligence_cache  ENABLE ROW LEVEL SECURITY;
@@ -545,6 +648,11 @@ CREATE POLICY "profiles_deny_anon" ON profiles
 
 -- credit_balances: anon cannot access.
 CREATE POLICY "credit_balances_deny_anon" ON credit_balances
+  FOR ALL TO anon
+  USING (false) WITH CHECK (false);
+
+-- credit_lots: anon cannot access.
+CREATE POLICY "credit_lots_deny_anon" ON credit_lots
   FOR ALL TO anon
   USING (false) WITH CHECK (false);
 
