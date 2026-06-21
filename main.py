@@ -857,15 +857,48 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
     from ai.outreach_generator import generate_outreach_messages
     db = get_supabase()
 
-    # 1. Fetch all leads for this task
+    # 1. Resolve the real task_id — the frontend may pass either a tasks.id
+    # or a smart_collections.id. Try tasks first, then fall back to collections.
+    real_task_id = req.task_id
+
+    # Check if it's a valid task_id first
+    task_check = (
+        db.table("tasks")
+        .select("id")
+        .eq("id", req.task_id)
+        .limit(1)
+        .execute()
+    )
+    if not task_check.data:
+        # Not a task — check if it's a smart_collections.id
+        col_check = (
+            db.table("smart_collections")
+            .select("id, task_id")
+            .eq("id", req.task_id)
+            .limit(1)
+            .execute()
+        )
+        if col_check.data and col_check.data[0].get("task_id"):
+            real_task_id = col_check.data[0]["task_id"]
+            print(f"[OUTREACH-BATCH] Resolved collection {req.task_id} → task {real_task_id}")
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="No task or collection found with that ID. Try refreshing the page."
+            )
+
+    # 2. Fetch all leads for this task
     leads_result = (
         db.table("workspace_leads")
         .select("*")
-        .eq("task_id", req.task_id)
+        .eq("task_id", real_task_id)
         .execute()
     )
     if not leads_result.data:
-        raise HTTPException(status_code=404, detail="No leads found for this task.")
+        raise HTTPException(
+            status_code=404,
+            detail="This collection has no leads yet. Run a search first."
+        )
 
     leads = leads_result.data
     if not leads:
