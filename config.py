@@ -136,6 +136,16 @@ RATE_LIMIT_SEARCHES_PER_MINUTE = 5
 RATE_LIMIT_API_PER_MINUTE = 60
 
 # ============================================================
+# RESEND — Transactional Email
+# ============================================================
+# Only sends if RESEND_API_KEY is set. Silent no-op otherwise.
+# Get a key from https://resend.com → API Keys.
+# From-email must be on a domain verified in Resend dashboard.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Bad Decision <noreply@baddecision.app>").strip()
+RESEND_API_BASE = "https://api.resend.com/emails"
+
+# ============================================================
 # SENTRY — Error Tracking
 # ============================================================
 # Optional. If SENTRY_DSN is not set, Sentry is silently skipped.

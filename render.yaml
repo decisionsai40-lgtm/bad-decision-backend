@@ -36,5 +36,9 @@ services:
         value: "production"
       - key: SENTRY_TRACES_SAMPLE_RATE
         value: "0.1"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
       - key: PYTHON_VERSION
         value: "3.11.9"

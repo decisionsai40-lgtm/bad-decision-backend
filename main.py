@@ -17,6 +17,7 @@ KEY DESIGN:
 """
 
 import time
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -626,6 +627,50 @@ async def get_credit_balance(
     except Exception as e:
         print(f"[API] Warning: could not fetch lot summary: {e}")
 
+    # Credit-low warning: if balance ≤ 10 and no warning email sent in last 7 days,
+    # send one. Track via credit_transactions with transaction_type='credit_low_email'.
+    balance_now = row["credits_balance"]
+    if 0 < balance_now <= 10:
+        try:
+            seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            recent_warning = (
+                db.table("credit_transactions")
+                .select("id")
+                .eq("user_id", user_id)
+                .eq("transaction_type", "credit_low_email")
+                .gt("created_at", seven_days_ago)
+                .limit(1)
+                .execute()
+            )
+            if not recent_warning.data:
+                # Fetch user's email + tier + name for the email
+                profile = (
+                    db.table("profiles")
+                    .select("email, full_name, tier")
+                    .eq("id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                if profile.data:
+                    p = profile.data[0]
+                    from email.senders import send_credit_low_email
+                    await send_credit_low_email(
+                        to_email=p["email"],
+                        full_name=p.get("full_name", ""),
+                        credits_remaining=balance_now,
+                        tier=p.get("tier", "free"),
+                    )
+                    # Log that we sent the warning (prevents spamming)
+                    db.table("credit_transactions").insert({
+                        "user_id": user_id,
+                        "amount": 0,
+                        "transaction_type": "credit_low_email",
+                        "description": f"Credit-low warning sent (balance: {balance_now})",
+                        "reference_id": f"credit_low_{user_id}_{int(datetime.utcnow().timestamp())}",
+                    }).execute()
+        except Exception as e:
+            print(f"[API] Warning: credit-low email check failed: {e}")
+
     return {
         "balance": {
             "credits_balance": row["credits_balance"],
@@ -1070,6 +1115,52 @@ async def get_user_collections(
         .execute()
     )
     return {"collections": result.data}
+
+
+# ============================================================
+# TRANSACTIONAL EMAIL ENDPOINTS
+# ============================================================
+# Called by the frontend webhooks (Clerk signup, Paystack payment) to
+# trigger transactional emails via Resend. Best-effort: never blocks the
+# webhook response, never raises on failure.
+
+class SendEmailRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=256)
+    full_name: str = Field(default="", max_length=256)
+
+
+class PaymentReceiptEmailRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=256)
+    full_name: str = Field(default="", max_length=256)
+    credits: int = Field(..., gt=0, le=1000000)
+    amount_ngn_kobo: int = Field(..., gt=0)
+    reference: str = Field(..., min_length=1, max_length=256)
+    description: str = Field(default="", max_length=500)
+
+
+@app.post("/api/email/welcome")
+async def send_welcome_email_endpoint(req: SendEmailRequest, x_api_secret: Optional[str] = Header(None)):
+    """Send the welcome email. Called by the Clerk webhook after handle_new_user."""
+    verify_api_secret(x_api_secret)
+    from email.senders import send_welcome_email
+    success = await send_welcome_email(req.email, req.full_name)
+    return {"success": success}
+
+
+@app.post("/api/email/payment-receipt")
+async def send_payment_receipt_endpoint(req: PaymentReceiptEmailRequest, x_api_secret: Optional[str] = Header(None)):
+    """Send a payment receipt. Called by the Paystack webhook after add_credits."""
+    verify_api_secret(x_api_secret)
+    from email.senders import send_payment_receipt_email
+    success = await send_payment_receipt_email(
+        to_email=req.email,
+        full_name=req.full_name,
+        credits=req.credits,
+        amount_ngn_kobo=req.amount_ngn_kobo,
+        reference=req.reference,
+        description=req.description,
+    )
+    return {"success": success}
 
 
 # ============================================================
