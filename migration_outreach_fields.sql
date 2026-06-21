@@ -23,5 +23,7 @@ ALTER TABLE profiles ADD COLUMN IF NOT EXISTS user_service TEXT DEFAULT '';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_audience TEXT DEFAULT '';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS copywriting_style TEXT DEFAULT 'david_ogilvy'
   CHECK (copywriting_style IN ('dan_kennedy','donald_miller','ray_edwards','david_ogilvy','jay_abraham','gary_halbert'));
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS company_name TEXT DEFAULT '';
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT '';
 
 -- Done. The backend can now generate and store personalized outreach messages.

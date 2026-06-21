@@ -2,34 +2,26 @@
 BAD DECISION — Outreach Message Generator
 ==========================================
 
+Uses deepseek-chat (flagship, non-thinking mode) for FAST generation.
+deepseek-reasoner was too slow (30-60s per lead). deepseek-chat is the
+flagship model without the reasoning step — much faster (~5-10s per lead)
+while still producing high-quality output.
+
 Generates 4 personalized outreach outputs per lead:
   1. EMAIL SUBJECT   (40-70 chars)
   2. EMAIL message   (500-530 chars, complete)
   3. SOCIAL DM       (500-530 chars, complete)
   4. CALL SCRIPT     (500-530 chars, complete)
 
-USES THE ADVANCED MODEL (deepseek-reasoner):
-  - deepseek-reasoner can reason through the message structure before writing,
-    producing more complete, coherent messages that don't get cut off.
-  - It does NOT support response_format: json_object, so we parse JSON manually.
-
 COMPLETENESS-FIRST CHARACTER ENFORCEMENT:
-  - The #1 priority is that every message is COMPLETE (ends with proper punctuation,
-    no mid-sentence cuts, no trailing "..." unless intentional).
+  - The #1 priority is that every message is COMPLETE (ends with proper punctuation).
   - The #2 priority is hitting the 500-530 character window.
-  - If a message is slightly under/over but complete, we accept it (450-580 tolerance).
-  - If a message is significantly out of range, we regenerate ONCE with explicit feedback.
-  - We NEVER hard-cut a message mid-sentence to meet the char count — that creates
-    the "incomplete message" problem the user reported.
-  - If too long: trim at a sentence boundary. If that puts us under 450, keep the
-    original complete message instead (completeness > exact char count).
-  - If too short: append a relevant call-to-action sentence that fits naturally.
+  - We NEVER hard-cut a message mid-sentence to meet the char count.
 
-COPYWRITING STYLES (6):
-  dan_kennedy, donald_miller, ray_edwards, david_ogilvy, jay_abraham, gary_halbert
-
-NO PLACEHOLDERS:
-  Messages must be ready-to-send — no [Your Name], no [Company], etc.
+PERSONALIZATION:
+  - Uses the sender's company name, service, and target audience
+  - References the lead's specific business name, website, and decision maker
+  - Messages are written to feel like they were written FOR this specific lead
 """
 
 import json
@@ -37,28 +29,23 @@ import re
 from typing import Dict, Any
 
 from ai.deepseek_middleware import execute_llm_payload, CriticalError
-from config import DEEPSEEK_SCOUT_MODEL, DEEPSEEK_SCHOLAR_MODEL
+from config import DEEPSEEK_SCOUT_MODEL
 
 
 # ============================================================
 # CHARACTER LIMITS — with completeness tolerance
 # ============================================================
-# Target window: 500-530 chars
-# Tolerance: 450-580 chars (accept if the message is complete and close to range)
 MIN_CHARS = 500
 MAX_CHARS = 530
-TOLERANCE_MIN = 450   # below this, we try to extend
-TOLERANCE_MAX = 580   # above this, we try to trim
+TOLERANCE_MIN = 450
+TOLERANCE_MAX = 580
 
-# Subject line limits
 SUBJECT_MIN = 40
 SUBJECT_MAX = 70
 
-# Use the advanced reasoning model for better message quality.
-# deepseek-reasoner can think through the message structure before writing,
-# which produces more complete, coherent messages.
-USE_REASONER = True
-MODEL = DEEPSEEK_SCHOLAR_MODEL if USE_REASONER else DEEPSEEK_SCOUT_MODEL
+# Use deepseek-chat (flagship, non-thinking) for FAST generation.
+# deepseek-reasoner was too slow (30-60s per lead). deepseek-chat is ~5-10s.
+MODEL = DEEPSEEK_SCOUT_MODEL
 
 
 # ============================================================
@@ -67,7 +54,7 @@ MODEL = DEEPSEEK_SCHOLAR_MODEL if USE_REASONER else DEEPSEEK_SCOUT_MODEL
 STYLE_PROMPTS: Dict[str, str] = {
     "dan_kennedy": (
         "Write in Dan Kennedy's no-nonsense direct-response style: "
-        "punchy opener, a specific pain point, a concrete promise with a deadline, "
+        "punchy opener, a specific pain point, a concrete promise, "
         "and a single clear call-to-action. Conversational but urgent."
     ),
     "donald_miller": (
@@ -101,31 +88,62 @@ STYLE_PROMPTS: Dict[str, str] = {
 # ============================================================
 # PROMPT BUILDER
 # ============================================================
-def _build_prompt(lead: Dict[str, Any], user_service: str, target_audience: str, style: str) -> str:
+def _build_prompt(
+    lead: Dict[str, Any],
+    user_service: str,
+    target_audience: str,
+    style: str,
+    sender_company: str = "",
+    sender_name: str = "",
+) -> str:
     """Build the user-message prompt for DeepSeek."""
-    company = lead.get("company_name") or lead.get("author_username") or "your business"
+    # Lead context — make it VERY specific so messages feel personalized
+    company = lead.get("company_name") or lead.get("author_username") or "this business"
     dm_name = lead.get("dm_name") or ""
     dm_position = lead.get("dm_position") or ""
     website = lead.get("website_url") or ""
     email = lead.get("verified_email") or ""
     phone = lead.get("phone") or ""
+    address = lead.get("address") or ""
+    category = lead.get("category") or ""
+    rating = lead.get("rating")
+    review_count = lead.get("review_count")
     intent = lead.get("intent_text") or lead.get("intent_level") or ""
 
     style_instruction = STYLE_PROMPTS.get(style, STYLE_PROMPTS["david_ogilvy"])
 
-    dm_line = f"- Decision Maker: {dm_name} ({dm_position})" if dm_name else "- Decision Maker: (unknown)"
+    # Build rich lead context so the AI can write a SPECIFIC, relevant message
+    lead_details = [f"BUSINESS NAME: {company}"]
+    if dm_name:
+        lead_details.append(f"CONTACT PERSON: {dm_name}" + (f", {dm_position}" if dm_position else ""))
+    if website:
+        lead_details.append(f"WEBSITE: {website}")
+    if email and email != "ABSENT":
+        lead_details.append(f"EMAIL: {email}")
+    if phone and phone != "ABSENT":
+        lead_details.append(f"PHONE: {phone}")
+    if address and address != "ABSENT":
+        lead_details.append(f"LOCATION: {address}")
+    if category and category != "ABSENT":
+        lead_details.append(f"BUSINESS TYPE: {category}")
+    if rating:
+        lead_details.append(f"RATING: {rating} stars" + (f" ({review_count} reviews)" if review_count else ""))
+    if intent and intent != "ABSENT":
+        lead_details.append(f"INTENT SIGNAL: {intent}")
 
-    lead_context = f"""LEAD CONTEXT:
-- Company / Name: {company}
-{dm_line}
-- Website: {website}
-- Email: {email}
-- Phone: {phone}
-- Intent signal: {intent}"""
+    lead_context = "\n".join(lead_details)
 
-    sender_context = f"""SENDER CONTEXT:
-- What the sender sells: {user_service}
-- Who the sender's ideal customer is: {target_audience or 'businesses like this one'}"""
+    # Sender context — include company name for personalization
+    sender_lines = [f"SENDER'S SERVICE: {user_service}"]
+    if sender_company:
+        sender_lines.append(f"SENDER'S COMPANY NAME: {sender_company}")
+    if sender_name:
+        sender_lines.append(f"SENDER'S NAME: {sender_name}")
+    sender_lines.append(f"SENDER'S TARGET AUDIENCE: {target_audience or 'businesses like this one'}")
+    sender_context = "\n".join(sender_lines)
+
+    # Sign-off instruction
+    sign_off = f' Sign off as "{sender_name or "Alex"} from {sender_company or "Bad Decision"}".' if (sender_company or sender_name) else ' Sign off as "Alex from Bad Decision".'
 
     char_rule = f"""CHARACTER LIMITS (CRITICAL):
 - email_subject: {SUBJECT_MIN}-{SUBJECT_MAX} characters
@@ -134,43 +152,47 @@ def _build_prompt(lead: Dict[str, Any], user_service: str, target_audience: str,
 - call_script: {MIN_CHARS}-{MAX_CHARS} characters
 
 COMPLETENESS RULE (MOST IMPORTANT):
-Every message MUST be a COMPLETE, finished thought. It must end with proper
-punctuation (period, question mark, or exclamation). NEVER cut off a sentence
-mid-way to meet the character count. If you're running long, remove a detail
-or tighten the wording — do NOT truncate. If you're running short, add a
-specific detail or a call-to-action sentence.
+Every message MUST be COMPLETE — end with proper punctuation (. ! or ?).
+NEVER cut off a sentence mid-way to meet the character count.
 
-The email_subject is SEPARATE from the email_message body. Do NOT include
-the subject line inside the email_message field."""
+PERSONALIZATION RULE (CRITICAL):
+Every message MUST reference the lead's SPECIFIC business by name ({company}).
+The message must make it clear that it was written for {company} specifically,
+not a generic template. Reference their website, location, or business type
+when relevant. Do NOT write generic messages that could apply to any business.
+
+The email_subject is SEPARATE from the email_message body."""
 
     return f"""You are an expert copywriter writing personalized outreach messages.
 
 {style_instruction}
 
+LEAD INFORMATION (the business you are writing TO):
 {lead_context}
 
+YOUR INFORMATION (the business you are writing FROM):
 {sender_context}
 
 {char_rule}
 
 TASK:
 Write FOUR outputs for this lead. Each must be ready-to-send with NO placeholders
-(no [Your Name], no [Company], etc.) — use the actual lead data above.
+(no [Your Name], no [Company], etc.) — use the actual data above.
 
 1. "email_subject" — a subject line for the cold email. {SUBJECT_MIN}-{SUBJECT_MAX} chars.
-   Curiosity-driven, specific to the lead, NOT spammy. No clickbait.
+   Must reference {company} or their industry specifically. Curiosity-driven, NOT spammy.
 
 2. "email_message" — a cold email body (NOT including the subject). {MIN_CHARS}-{MAX_CHARS} chars.
-   Include a greeting using the DM name if known, a body that connects the sender's
-   service to the lead's situation, and a soft call-to-action. Sign off as
-   "Alex from Bad Decision" (or omit if it pushes over the limit).
+   Start with a greeting using "{dm_name or "there"}". The body MUST connect YOUR service
+   to THEIR specific business situation. Reference their business name, website, or location.{sign_off}
 
 3. "social_message" — a LinkedIn or Instagram DM. {MIN_CHARS}-{MAX_CHARS} chars.
-   More casual, shorter sentences. Can reference the lead's website or business.
+   More casual tone. Must mention {company} by name. Reference something specific
+   about their business (website, location, or business type).
 
 4. "call_script" — a phone call opening script (first 30 seconds). {MIN_CHARS}-{MAX_CHARS} chars.
-   Include a greeting, a reason for calling tied to the lead's business, and a
-   permission-based question to continue the conversation.
+   Include a greeting, mention you're calling about {company} specifically,
+   give a reason for calling tied to their business, and ask a permission question.
 
 Return ONLY a JSON object with exactly these keys (no markdown, no code fences):
 {{
@@ -185,84 +207,62 @@ Return ONLY a JSON object with exactly these keys (no markdown, no code fences):
 # CHARACTER ENFORCEMENT — completeness-first
 # ============================================================
 def _is_complete(message: str) -> bool:
-    """Check if a message ends with proper punctuation (is a complete thought)."""
+    """Check if a message ends with proper punctuation."""
     if not message:
         return False
     stripped = message.rstrip()
     if not stripped:
         return False
-    last_char = stripped[-1]
-    return last_char in '.!?'
+    return stripped[-1] in '.!?'
 
 def _enforce_length(message: str, kind: str = "message") -> str:
-    """
-    Force a message toward the [MIN_CHARS, MAX_CHARS] window.
-    COMPLETENESS IS PRIORITY #1 — never cut a message mid-sentence.
-
-    Strategy:
-    - If already in [MIN_CHARS, MAX_CHARS]: return as-is.
-    - If in tolerance range [TOLERANCE_MIN, TOLERANCE_MAX] and complete: return as-is.
-    - If too long (> TOLERANCE_MAX): trim at sentence boundary. If trimmed version
-      is < TOLERANCE_MIN, keep the original (completeness > char count).
-    - If too short (< TOLERANCE_MIN): append a relevant CTA sentence.
-    """
+    """Force a message toward the [MIN_CHARS, MAX_CHARS] window. Never cut mid-sentence."""
     if not message:
-        message = ""
+        return ""
 
     message = message.strip()
     if not message:
         return ""
 
-    # If already in target window, return as-is
     if MIN_CHARS <= len(message) <= MAX_CHARS:
         return message
 
-    # If in tolerance range AND complete, accept it
     if TOLERANCE_MIN <= len(message) <= TOLERANCE_MAX and _is_complete(message):
         return message
 
-    # TOO LONG → trim at sentence boundary (never mid-sentence)
+    # TOO LONG → trim at sentence boundary
     if len(message) > MAX_CHARS:
-        # Find the last sentence boundary at or before MAX_CHARS
         cut_zone = message[:MAX_CHARS]
         boundary = -1
-        # Look for sentence-ending punctuation followed by space or end
         for punct in ['. ', '! ', '? ', '."', '!"', '?"', '.\n', '!\n', '?\n']:
             idx = cut_zone.rfind(punct)
             if idx > boundary:
                 boundary = idx
 
         if boundary >= TOLERANCE_MIN - 50:
-            # Trim at the sentence boundary + include the punctuation
             trimmed = message[:boundary + 1].rstrip()
             if TOLERANCE_MIN <= len(trimmed) <= TOLERANCE_MAX:
                 return trimmed
-            # If trimmed is still too short, try extending to the next sentence
-            # boundary beyond MAX_CHARS (up to TOLERANCE_MAX)
-            next_boundary = message.find('. ', boundary + 1)
-            if next_boundary == -1:
-                next_boundary = message.find('! ', boundary + 1)
-            if next_boundary == -1:
-                next_boundary = message.find('? ', boundary + 1)
+            # Try extending to next sentence boundary
+            next_boundary = -1
+            for punct in ['. ', '! ', '? ']:
+                idx = message.find(punct, boundary + 1)
+                if idx != -1 and (next_boundary == -1 or idx < next_boundary):
+                    next_boundary = idx
             if next_boundary != -1 and next_boundary < TOLERANCE_MAX:
                 extended = message[:next_boundary + 1].rstrip()
                 if len(extended) <= TOLERANCE_MAX:
                     return extended
-            # If we can't find a good boundary, keep the original if it's within tolerance
             if len(message) <= TOLERANCE_MAX:
                 return message
-            # Last resort: hard cut at TOLERANCE_MAX with ellipsis (rare)
             return message[:TOLERANCE_MAX - 3].rstrip() + "..."
         else:
-            # No good sentence boundary — keep original if within tolerance
             if len(message) <= TOLERANCE_MAX:
                 return message
-            # Hard cut at TOLERANCE_MAX with ellipsis
             return message[:TOLERANCE_MAX - 3].rstrip() + "..."
 
-    # TOO SHORT → append a relevant CTA sentence
+    # TOO SHORT → append CTA
     if len(message) < MIN_CHARS:
-        # First, make sure the existing message ends with punctuation
         if not _is_complete(message):
             message += "."
 
@@ -272,61 +272,44 @@ def _enforce_length(message: str, kind: str = "message") -> str:
             " Want me to send the full breakdown? Just reply here.",
             " Let me know a good time and I'll walk you through it.",
             " Reply 'send it' and I'll forward everything you need.",
-            " I'd love to hear what you think — just hit reply.",
-            " Can I send you a quick 2-minute video showing exactly how?",
         ]
         for cta in cta_options:
             candidate = message + cta
             if MIN_CHARS <= len(candidate) <= MAX_CHARS:
                 return candidate
-        # If a single CTA overshoots, try shorter ones
-        short_ctas = [
-            " Reply to learn more.",
-            " Hit reply with 'yes'.",
-            " Want the details? Reply here.",
-        ]
+        short_ctas = [" Reply to learn more.", " Hit reply with 'yes'.", " Want the details? Reply here."]
         for cta in short_ctas:
             candidate = message + cta
             if TOLERANCE_MIN <= len(candidate) <= TOLERANCE_MAX:
                 return candidate
-        # If still too short, return as-is (completeness > exact char count)
         return message
 
     return message
 
 
 # ============================================================
-# JSON EXTRACTION — handles reasoner model output
+# JSON EXTRACTION
 # ============================================================
 def _extract_json(content: str) -> Dict[str, Any]:
-    """
-    Extract a JSON object from the model's response.
-    The reasoner model may include reasoning text before the JSON,
-    or wrap it in markdown code fences.
-    """
+    """Extract a JSON object from the model's response."""
     if not content:
         return {}
 
-    # Strip markdown code fences if present
     content = content.strip()
+    # Strip markdown code fences
     if content.startswith("```"):
-        # Remove ```json or ``` prefix and trailing ```
         lines = content.split("\n")
-        # Remove first line (```json or ```)
         if lines[0].strip().startswith("```"):
             lines = lines[1:]
-        # Remove last line if it's just ```
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         content = "\n".join(lines).strip()
 
-    # Try direct JSON parse
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
 
-    # Try to find a JSON object in the text
     json_match = re.search(r'\{[\s\S]*\}', content)
     if json_match:
         try:
@@ -345,25 +328,23 @@ async def generate_outreach_messages(
     user_service: str,
     target_audience: str,
     copywriting_style: str,
+    sender_company: str = "",
+    sender_name: str = "",
 ) -> Dict[str, str]:
     """
     Generate personalized outreach messages for a single lead.
-
-    Uses the advanced deepseek-reasoner model for better quality and completeness.
-
-    Returns:
-        Dict with keys: email_subject, email_message, social_message, call_script
+    Uses deepseek-chat (flagship, non-thinking) for fast generation.
     """
     if not user_service:
-        raise ValueError("user_service is required — tell the user to set up their service in Settings first.")
+        raise ValueError("user_service is required")
 
     style = copywriting_style if copywriting_style in STYLE_PROMPTS else "david_ogilvy"
-    prompt = _build_prompt(lead, user_service, target_audience, style)
+    prompt = _build_prompt(lead, user_service, target_audience, style, sender_company, sender_name)
 
-    # ---------- BUILD PAYLOAD ----------
-    # deepseek-reasoner does NOT support response_format: json_object.
-    # We rely on the prompt to instruct JSON output and parse manually.
-    payload: Dict[str, Any] = {
+    # ---------- PASS 1: initial generation ----------
+    # deepseek-chat supports response_format: json_object for reliable JSON output
+    print(f"[OUTREACH] Generating with model={MODEL} for lead: {lead.get('company_name', 'unknown')}")
+    response = await execute_llm_payload({
         "model": MODEL,
         "messages": [
             {
@@ -371,34 +352,23 @@ async def generate_outreach_messages(
                 "content": (
                     "You are an expert direct-response copywriter who writes personalized "
                     "outreach messages. You ALWAYS respond with a valid JSON object. "
-                    "Your messages are always complete — they never cut off mid-sentence. "
+                    "Your messages are always complete and specific to each lead. "
                     "You hit the target character count by adjusting detail and wording, "
                     "never by truncating."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
+        "response_format": {"type": "json_object"},
         "temperature": 0.7,
-    }
+    })
 
-    # Only add response_format for non-reasoner models
-    if not USE_REASONER:
-        payload["response_format"] = {"type": "json_object"}
-
-    # ---------- PASS 1: initial generation ----------
-    print(f"[OUTREACH] Generating with model={MODEL} for lead: {lead.get('company_name', 'unknown')}")
-    response = await execute_llm_payload(payload)
-
-    # The reasoner model returns content in choices[0].message.content
-    # (reasoning_content is separate and we don't need it)
     content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
     if not content:
-        print(f"[OUTREACH] WARNING: Empty content from model. Full response keys: {list(response.keys())}")
-        # Try to get reasoning_content as fallback (some models put output there)
+        print(f"[OUTREACH] WARNING: Empty content from model.")
         reasoning = response.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         if reasoning:
             content = reasoning
-            print(f"[OUTREACH] Using reasoning_content as fallback ({len(content)} chars)")
 
     parsed = _extract_json(content)
 
@@ -409,36 +379,31 @@ async def generate_outreach_messages(
 
     print(f"[OUTREACH] Initial lengths: subject={len(email_subj)}, email={len(email_msg)}, social={len(social_msg)}, call={len(call_msg)}")
 
-    # ---------- PASS 2: retry any messages that are significantly out of range ----------
+    # ---------- PASS 2: retry if significantly out of range or incomplete ----------
     async def _regenerate(kind: str, current: str) -> str:
-        """Regenerate a single message if it's way off the target length."""
         if TOLERANCE_MIN <= len(current) <= TOLERANCE_MAX and _is_complete(current):
             return current
         if not current:
             return current
 
+        company_name = lead.get("company_name") or "this business"
         retry_prompt = (
             f"The {kind} you just wrote is {len(current)} characters long and "
-            f"{'incomplete (cut off)' if not _is_complete(current) else 'out of range'}. "
-            f"It MUST be between {MIN_CHARS} and {MAX_CHARS} characters AND complete "
-            f"(end with proper punctuation). "
-            f"Rewrite ONLY this {kind} so it falls in that range and is a complete thought. "
-            f"Do NOT cut off mid-sentence. Adjust detail and wording to hit the target. "
-            f"Return JSON: {{\"{kind}\": \"...\"}}"
+            f"{'incomplete' if not _is_complete(current) else 'out of range'}. "
+            f"It MUST be between {MIN_CHARS} and {MAX_CHARS} characters AND complete. "
+            f"It MUST reference {company_name} specifically. "
+            f"Rewrite ONLY this {kind}. Return JSON: {{\"{kind}\": \"...\"}}"
         )
         try:
-            retry_payload: Dict[str, Any] = {
+            retry_response = await execute_llm_payload({
                 "model": MODEL,
                 "messages": [
-                    {"role": "system", "content": "You are an expert copywriter. Respond with valid JSON only. Your messages are always complete."},
+                    {"role": "system", "content": "You are an expert copywriter. Respond with valid JSON only."},
                     {"role": "user", "content": retry_prompt},
                 ],
+                "response_format": {"type": "json_object"},
                 "temperature": 0.6,
-            }
-            if not USE_REASONER:
-                retry_payload["response_format"] = {"type": "json_object"}
-
-            retry_response = await execute_llm_payload(retry_payload)
+            })
             retry_content = retry_response.get("choices", [{}])[0].get("message", {}).get("content", "")
             retry_parsed = _extract_json(retry_content)
             result = (retry_parsed.get(kind) or "").strip()
@@ -459,23 +424,21 @@ async def generate_outreach_messages(
         print(f"[OUTREACH] Regenerating call_script (len={len(call_msg)}, complete={_is_complete(call_msg)})")
         call_msg = await _regenerate("call_script", call_msg)
 
-    # ---------- FINAL ENFORCEMENT: completeness-first post-processing ----------
+    # ---------- FINAL ENFORCEMENT ----------
     email_final = _enforce_length(email_msg, "email")
     social_final = _enforce_length(social_msg, "social")
     call_final = _enforce_length(call_msg, "call")
 
-    # Log any messages that needed post-processing (for monitoring)
     if email_final != email_msg:
-        print(f"[OUTREACH] email_message post-processed: {len(email_msg)} → {len(email_final)} chars (complete={_is_complete(email_final)})")
+        print(f"[OUTREACH] email_message post-processed: {len(email_msg)} → {len(email_final)} chars")
     if social_final != social_msg:
-        print(f"[OUTREACH] social_message post-processed: {len(social_msg)} → {len(social_final)} chars (complete={_is_complete(social_final)})")
+        print(f"[OUTREACH] social_message post-processed: {len(social_msg)} → {len(social_final)} chars")
     if call_final != call_msg:
-        print(f"[OUTREACH] call_script post-processed: {len(call_msg)} → {len(call_final)} chars (complete={_is_complete(call_final)})")
+        print(f"[OUTREACH] call_script post-processed: {len(call_msg)} → {len(call_final)} chars")
 
-    # Enforce subject line length (40-70 chars)
+    # Subject line enforcement
     if email_subj:
         if len(email_subj) > SUBJECT_MAX:
-            # Trim at word boundary
             cut = email_subj[:SUBJECT_MAX]
             last_space = cut.rfind(" ")
             if last_space > SUBJECT_MIN:
@@ -483,7 +446,6 @@ async def generate_outreach_messages(
             else:
                 email_subj = cut.rstrip()
         elif len(email_subj) < SUBJECT_MIN and len(email_subj) > 0:
-            # Try to extend with a power word
             extensions = [" — quick question", " (30 seconds)", " — ideas inside", " worth a look?"]
             for ext in extensions:
                 if len(email_subj) + len(ext) <= SUBJECT_MAX and len(email_subj) + len(ext) >= SUBJECT_MIN:

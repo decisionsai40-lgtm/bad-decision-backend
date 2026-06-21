@@ -659,21 +659,32 @@ class UpdateSettingsRequest(BaseModel):
     user_service: str = Field(default="", max_length=500)
     target_audience: str = Field(default="", max_length=500)
     copywriting_style: str = Field(default="david_ogilvy", pattern=r"^(dan_kennedy|donald_miller|ray_edwards|david_ogilvy|jay_abraham|gary_halbert)$")
+    company_name: str = Field(default="", max_length=200)
+    sender_name: str = Field(default="", max_length=200)
 
 
 @app.put("/api/settings/{user_id}")
 async def update_user_settings(user_id: str, req: UpdateSettingsRequest, x_api_secret: Optional[str] = Header(None)):
-    """Update user settings (service, audience, copywriting style) for outreach messages."""
+    """Update user settings (company, service, audience, copywriting style) for outreach messages."""
     verify_api_secret(x_api_secret)
 
     from supabase_client import get_supabase
     db = get_supabase()
-    result = db.table("profiles").update({
+    update_data = {
         "user_service": req.user_service,
         "target_audience": req.target_audience,
         "copywriting_style": req.copywriting_style,
-        "updated_at": "now()",
-    }).eq("id", user_id).execute()
+    }
+    # Try to update company_name and sender_name (columns may not exist if migration not run)
+    try:
+        update_data["company_name"] = req.company_name
+        update_data["sender_name"] = req.sender_name
+        result = db.table("profiles").update(update_data).eq("id", user_id).execute()
+    except Exception:
+        # Fall back without company_name/sender_name
+        update_data.pop("company_name", None)
+        update_data.pop("sender_name", None)
+        result = db.table("profiles").update(update_data).eq("id", user_id).execute()
 
     return {"success": True, "settings": result.data[0] if result.data else None}
 
@@ -685,15 +696,26 @@ async def get_user_settings(user_id: str, x_api_secret: Optional[str] = Header(N
 
     from supabase_client import get_supabase
     db = get_supabase()
-    result = (
-        db.table("profiles")
-        .select("user_service, target_audience, copywriting_style")
-        .eq("id", user_id)
-        .limit(1)
-        .execute()
-    )
+    # Try to select company_name/sender_name (may not exist if migration not run)
+    try:
+        result = (
+            db.table("profiles")
+            .select("user_service, target_audience, copywriting_style, company_name, sender_name")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        # Fall back without company_name/sender_name
+        result = (
+            db.table("profiles")
+            .select("user_service, target_audience, copywriting_style")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
     if not result.data:
-        return {"settings": {"user_service": "", "target_audience": "", "copywriting_style": "david_ogilvy"}}
+        return {"settings": {"user_service": "", "target_audience": "", "copywriting_style": "david_ogilvy", "company_name": "", "sender_name": ""}}
     return {"settings": result.data[0]}
 
 
@@ -750,11 +772,13 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
     user_service = user_settings.get("user_service", "")
     target_audience = user_settings.get("target_audience", "")
     copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+    sender_company = user_settings.get("company_name", "")
+    sender_name = user_settings.get("sender_name", "")
 
     # 3. Generate the outreach messages
     try:
         outreach = await generate_outreach_messages(
-            lead, user_service, target_audience, copywriting_style
+            lead, user_service, target_audience, copywriting_style, sender_company, sender_name
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not generate messages: {str(e)}")
@@ -851,6 +875,8 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
     user_service = user_settings.get("user_service", "")
     target_audience = user_settings.get("target_audience", "")
     copywriting_style = user_settings.get("copywriting_style", "david_ogilvy")
+    sender_company = user_settings.get("company_name", "")
+    sender_name = user_settings.get("sender_name", "")
 
     # 3. Generate outreach for each lead
     success_count = 0
@@ -861,14 +887,13 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
             and lead.get("outreach_email") != "ABSENT"
         )
 
-        # Skip leads that already have messages UNLESS force_regenerate is True
         if has_existing and not req.force_regenerate:
             skipped_count += 1
             continue
 
         try:
             outreach = await generate_outreach_messages(
-                lead, user_service, target_audience, copywriting_style
+                lead, user_service, target_audience, copywriting_style, sender_company, sender_name
             )
             db.table("workspace_leads").update({
                 "outreach_email": outreach.get("email_message", "ABSENT"),
