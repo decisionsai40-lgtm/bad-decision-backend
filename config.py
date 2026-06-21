@@ -35,6 +35,16 @@ BACKEND_API_SECRET = os.getenv("BACKEND_API_SECRET", "").strip()
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "https://bad-decision-front-end.vercel.app").strip()
 
 # ============================================================
+# PAYSTACK — Subscriptions
+# ============================================================
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_API_BASE = "https://api.paystack.co"
+# Plan codes created via Paystack dashboard or API (one per tier)
+PAYSTACK_STARTER_PLAN_CODE = os.getenv("PAYSTACK_STARTER_PLAN_CODE", "").strip()
+PAYSTACK_GROWTH_PLAN_CODE = os.getenv("PAYSTACK_GROWTH_PLAN_CODE", "").strip()
+PAYSTACK_PRO_PLAN_CODE = os.getenv("PAYSTACK_PRO_PLAN_CODE", "").strip()
+
+# ============================================================
 # DEEPSEEK
 # ============================================================
 DEEPSEEK_KEY_RING = [

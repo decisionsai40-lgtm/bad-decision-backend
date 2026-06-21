@@ -613,6 +613,28 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
+-- 12e. SUBSCRIPTIONS TABLE (Phase C — recurring billing)
+-- ============================================================
+CREATE TABLE subscriptions (
+  id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id                   TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  plan_code                 TEXT NOT NULL,
+  tier                      TEXT NOT NULL,
+  status                    TEXT NOT NULL DEFAULT 'active',
+  paystack_customer_code    TEXT,
+  paystack_subscription_code TEXT,
+  paystack_email_token      TEXT,
+  current_period_end        TIMESTAMPTZ,
+  canceled_at               TIMESTAMPTZ,
+  created_at                TIMESTAMPTZ DEFAULT now(),
+  updated_at                TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_subscriptions_user ON subscriptions (user_id);
+CREATE INDEX idx_subscriptions_status ON subscriptions (status) WHERE status = 'active';
+CREATE INDEX idx_subscriptions_user_active ON subscriptions (user_id, status) WHERE status = 'active';
+
+-- ============================================================
 -- 13. ROW LEVEL SECURITY (RLS)
 -- ============================================================
 -- The backend uses the SERVICE ROLE key which BYPASSES RLS entirely.
@@ -640,6 +662,7 @@ ALTER TABLE tasks                      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE global_intelligence_cache  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE smart_collections          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_leads            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subscriptions              ENABLE ROW LEVEL SECURITY;
 
 -- profiles: anon cannot access. service_role bypasses.
 CREATE POLICY "profiles_deny_anon" ON profiles
@@ -658,6 +681,11 @@ CREATE POLICY "credit_lots_deny_anon" ON credit_lots
 
 -- credit_transactions: anon cannot access.
 CREATE POLICY "credit_tx_deny_anon" ON credit_transactions
+  FOR ALL TO anon
+  USING (false) WITH CHECK (false);
+
+-- subscriptions: anon cannot access.
+CREATE POLICY "subscriptions_deny_anon" ON subscriptions
   FOR ALL TO anon
   USING (false) WITH CHECK (false);
 

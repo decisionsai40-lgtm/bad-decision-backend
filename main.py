@@ -31,6 +31,8 @@ from config import (
     CREDIT_COST_SCAN, CREDIT_COST_DEEP, CREDIT_COST_SMTP,
     LEAD_TARGET_FREE, LEAD_TARGET_PAID,
     SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_TRACES_SAMPLE_RATE,
+    PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE,
+    PAYSTACK_STARTER_PLAN_CODE, PAYSTACK_GROWTH_PLAN_CODE, PAYSTACK_PRO_PLAN_CODE,
 )
 
 # ============================================================
@@ -1115,6 +1117,220 @@ async def get_user_collections(
         .execute()
     )
     return {"collections": result.data}
+
+
+# ============================================================
+# SUBSCRIPTION ENDPOINTS (Phase C — recurring billing)
+# ============================================================
+class CreateSubscriptionRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=256)
+    tier: str = Field(..., pattern=r"^(starter|growth|pro)$")
+
+
+PLAN_CODES = {
+    "starter": PAYSTACK_STARTER_PLAN_CODE,
+    "growth":  PAYSTACK_GROWTH_PLAN_CODE,
+    "pro":     PAYSTACK_PRO_PLAN_CODE,
+}
+
+PLAN_CREDITS = {"starter": 500, "growth": 1500, "pro": 4000}
+
+
+@app.post("/api/subscriptions/create")
+async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Optional[str] = Header(None)):
+    """Initialize a Paystack subscription for the user.
+    Returns an authorization_url the user must visit to authorize recurring billing.
+    """
+    verify_api_secret(x_api_secret)
+
+    plan_code = PLAN_CODES.get(req.tier)
+    if not plan_code:
+        raise HTTPException(status_code=400, detail=f"Plan code not configured for tier '{req.tier}'.")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+
+    # Fetch user's email
+    profile = db.table("profiles").select("email").eq("id", req.user_id).limit(1).execute()
+    if not profile.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_email = profile.data[0]["email"]
+
+    # Check if user already has an active subscription
+    existing = (
+        db.table("subscriptions")
+        .select("id, status, tier")
+        .eq("user_id", req.user_id)
+        .eq("status", "active")
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(
+            status_code=409,
+            detail=f"You already have an active {existing.data[0]['tier']} subscription. Cancel it first to switch plans."
+        )
+
+    # Call Paystack /transaction/initialize with the plan code
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{PAYSTACK_API_BASE}/transaction/initialize",
+                headers={
+                    "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "email": user_email,
+                    "plan": plan_code,
+                    "callback_url": "https://bad-decision-front-end.vercel.app/dashboard?sub=success",
+                    "metadata": {
+                        "user_id": req.user_id,
+                        "tier": req.tier,
+                        "type": "subscription",
+                    },
+                },
+            )
+            if response.status_code != 200:
+                print(f"[SUBSCRIPTION] Paystack error: {response.text[:300]}")
+                raise HTTPException(status_code=502, detail="Paystack error initializing subscription.")
+            paystack_data = response.json().get("data", {})
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Paystack timeout. Please try again.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SUBSCRIPTION] Error: {e}")
+        raise HTTPException(status_code=500, detail="Could not initialize subscription.")
+
+    # Save pending subscription to DB (status will be updated by webhook)
+    db.table("subscriptions").insert({
+        "user_id": req.user_id,
+        "plan_code": plan_code,
+        "tier": req.tier,
+        "status": "trialing",  # trialing until first payment confirms
+        "paystack_subscription_code": paystack_data.get("reference"),
+    }).execute()
+
+    return {
+        "success": True,
+        "authorization_url": paystack_data.get("authorization_url"),
+        "reference": paystack_data.get("reference"),
+    }
+
+
+@app.post("/api/subscriptions/cancel")
+async def cancel_subscription(
+    req: CreateSubscriptionRequest,
+    x_api_secret: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Cancel a user's active subscription via Paystack + update DB."""
+    verify_api_secret(x_api_secret)
+    if x_user_id and req.user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+
+    # Find active subscription
+    sub = (
+        db.table("subscriptions")
+        .select("id, paystack_subscription_code, tier")
+        .eq("user_id", req.user_id)
+        .eq("status", "active")
+        .limit(1)
+        .execute()
+    )
+    if not sub.data:
+        raise HTTPException(status_code=404, detail="No active subscription found.")
+
+    sub_code = sub.data[0].get("paystack_subscription_code")
+    if not sub_code:
+        # No Paystack code — just mark as canceled in DB
+        db.table("subscriptions").update({
+            "status": "canceled",
+            "canceled_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", sub.data[0]["id"]).execute()
+        return {"success": True, "message": "Subscription canceled."}
+
+    # Call Paystack to disable the subscription
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{PAYSTACK_API_BASE}/subscription/disable",
+                headers={
+                    "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"code": sub_code, "token": sub_code},
+            )
+            if response.status_code != 200:
+                print(f"[SUBSCRIPTION] Paystack cancel error: {response.text[:300]}")
+    except Exception as e:
+        print(f"[SUBSCRIPTION] Cancel error: {e}")
+
+    # Update DB
+    db.table("subscriptions").update({
+        "status": "canceled",
+        "canceled_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", sub.data[0]["id"]).execute()
+
+    return {"success": True, "message": f"Your {sub.data[0]['tier']} subscription has been canceled."}
+
+
+@app.get("/api/subscriptions/{user_id}")
+async def get_subscription_status(
+    user_id: str,
+    x_api_secret: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Get the user's current subscription status."""
+    verify_api_secret(x_api_secret)
+    if x_user_id and user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("subscriptions")
+        .select("id, tier, status, current_period_end, canceled_at, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return {"subscription": None}
+    return {"subscription": result.data[0]}
+
+
+@app.get("/api/billing/history/{user_id}")
+async def get_billing_history(
+    user_id: str,
+    x_api_secret: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Get a user's billing history (all credit transactions)."""
+    verify_api_secret(x_api_secret)
+    if x_user_id and user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    from supabase_client import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("credit_transactions")
+        .select("id, amount, transaction_type, description, reference_id, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    )
+    return {"transactions": result.data}
 
 
 # ============================================================
