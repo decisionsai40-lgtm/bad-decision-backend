@@ -168,6 +168,20 @@ def root():
     }
 
 
+@app.get("/api/debug/routes")
+def debug_routes():
+    """List all registered routes — used to diagnose 404 issues."""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, 'methods') and hasattr(route, 'path'):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods) if route.methods else [],
+                "name": getattr(route, 'name', 'unknown'),
+            })
+    return {"routes": routes, "count": len(routes)}
+
+
 @app.get("/health")
 def health_check():
     """Detailed health check including database connectivity."""
@@ -821,6 +835,7 @@ class BatchOutreachRequest(BaseModel):
 
 
 @app.post("/api/outreach/generate-batch")
+@app.post("/api/outreach/batch")
 async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optional[str] = Header(None)):
     """
     Generate outreach messages for ALL leads in a task (collection).
@@ -969,6 +984,14 @@ async def startup_event():
     if not BACKEND_API_SECRET:
         print("[STARTUP] WARNING: BACKEND_API_SECRET is not set! All API requests will be rejected.")
         print("[STARTUP] Set BACKEND_API_SECRET in your environment variables.")
+
+    # Print all registered routes for debugging
+    print("[STARTUP] === REGISTERED ROUTES ===")
+    for route in app.routes:
+        if hasattr(route, 'methods') and hasattr(route, 'path'):
+            methods = ','.join(sorted(route.methods)) if route.methods else ''
+            print(f"  {methods:20s} {route.path}")
+    print("[STARTUP] === END ROUTES ===")
 
     import asyncio
     try:
