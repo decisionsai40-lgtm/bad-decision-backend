@@ -2,10 +2,7 @@
 BAD DECISION — Outreach Message Generator
 ==========================================
 
-Uses deepseek-chat (flagship, non-thinking mode) for FAST generation.
-deepseek-reasoner was too slow (30-60s per lead). deepseek-chat is the
-flagship model without the reasoning step — much faster (~5-10s per lead)
-while still producing high-quality output.
+Uses deepseek-chat (flagship, non-thinking) for FAST generation (~5-10s per lead).
 
 Generates 4 personalized outreach outputs per lead:
   1. EMAIL SUBJECT   (40-70 chars)
@@ -13,15 +10,17 @@ Generates 4 personalized outreach outputs per lead:
   3. SOCIAL DM       (500-530 chars, complete)
   4. CALL SCRIPT     (500-530 chars, complete)
 
-COMPLETENESS-FIRST CHARACTER ENFORCEMENT:
-  - The #1 priority is that every message is COMPLETE (ends with proper punctuation).
-  - The #2 priority is hitting the 500-530 character window.
-  - We NEVER hard-cut a message mid-sentence to meet the char count.
+PERSONALIZATION STRATEGY:
+  - Scrapes the lead's website for unique details (services, about text, specialties)
+  - Uses the sender's company name, service, and target audience from Settings
+  - Messages are written as COLD OUTREACH from the sender's business TO the lead
+  - References specific details found on the lead's website (not generic stuff like ratings)
+  - Does NOT include review counts, star ratings, or generic platform data
+  - Fixes "Hi ABSENT" bug: uses company name or "there" when DM name is missing
 
-PERSONALIZATION:
-  - Uses the sender's company name, service, and target audience
-  - References the lead's specific business name, website, and decision maker
-  - Messages are written to feel like they were written FOR this specific lead
+COMPLETENESS-FIRST:
+  - Every message must end with proper punctuation
+  - Never cut mid-sentence to meet char count
 """
 
 import json
@@ -30,10 +29,11 @@ from typing import Dict, Any
 
 from ai.deepseek_middleware import execute_llm_payload, CriticalError
 from config import DEEPSEEK_SCOUT_MODEL
+from scraping.email_scraper import scrape_website_for_emails
 
 
 # ============================================================
-# CHARACTER LIMITS — with completeness tolerance
+# CHARACTER LIMITS
 # ============================================================
 MIN_CHARS = 500
 MAX_CHARS = 530
@@ -43,8 +43,6 @@ TOLERANCE_MAX = 580
 SUBJECT_MIN = 40
 SUBJECT_MAX = 70
 
-# Use deepseek-chat (flagship, non-thinking) for FAST generation.
-# deepseek-reasoner was too slow (30-60s per lead). deepseek-chat is ~5-10s.
 MODEL = DEEPSEEK_SCOUT_MODEL
 
 
@@ -86,6 +84,88 @@ STYLE_PROMPTS: Dict[str, str] = {
 
 
 # ============================================================
+# WEBSITE SCRAPER — extracts unique details for personalization
+# ============================================================
+async def _scrape_lead_website(website_url: str) -> str:
+    """
+    Scrape the lead's website to extract unique details for personalization.
+    Returns a short summary of what the business does, their specialties, etc.
+    """
+    if not website_url or website_url == "ABSENT":
+        return ""
+
+    try:
+        result = await scrape_website_for_emails(website_url)
+        # The scraper returns emails, phone, social links.
+        # We also need the page text to extract business details.
+        # Let's do a quick fetch of the homepage text.
+        import httpx
+        from urllib.parse import urlparse
+        from config import SOURCE_TIMEOUT
+
+        domain = urlparse(website_url if website_url.startswith("http") else f"https://{website_url}").hostname or ""
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        if not domain:
+            return ""
+
+        async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get(
+                f"https://{domain}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            if response.status_code == 200:
+                html = response.text
+                # Extract text content (strip HTML tags)
+                text = re.sub(r'<script[^>]*>[\s\S]*?</script>', '', html, flags=re.IGNORECASE)
+                text = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', text, flags=re.IGNORECASE)
+                text = re.sub(r'<[^>]+>', ' ', text)
+                text = re.sub(r'\s+', ' ', text).strip()
+
+                # Extract the title
+                title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE)
+                title = title_match.group(1).strip() if title_match else ""
+
+                # Extract meta description
+                desc_match = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                description = desc_match.group(1).strip() if desc_match else ""
+
+                # Extract h1 tags
+                h1_matches = re.findall(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
+                h1_text = " ".join(re.sub(r'<[^>]+>', '', h).strip() for h in h1_matches[:2])
+
+                # Build a summary of what we found
+                parts = []
+                if title:
+                    parts.append(f"Website title: {title}")
+                if description:
+                    parts.append(f"Meta description: {description}")
+                if h1_text:
+                    parts.append(f"Headlines: {h1_text}")
+
+                # Extract some body text (first 500 chars of visible text)
+                if text and len(text) > 50:
+                    # Try to find the "about" or "services" section
+                    about_idx = text.lower().find("about")
+                    services_idx = text.lower().find("services")
+                    if about_idx >= 0 and about_idx < len(text) - 100:
+                        parts.append(f"About text: {text[about_idx:about_idx+300]}")
+                    elif services_idx >= 0 and services_idx < len(text) - 100:
+                        parts.append(f"Services text: {text[services_idx:services_idx+300]}")
+                    else:
+                        parts.append(f"Page text: {text[:300]}")
+
+                if parts:
+                    return " | ".join(parts)
+
+        return ""
+    except Exception as e:
+        print(f"[OUTREACH] Website scrape failed for {website_url}: {e}")
+        return ""
+
+
+# ============================================================
 # PROMPT BUILDER
 # ============================================================
 def _build_prompt(
@@ -93,57 +173,75 @@ def _build_prompt(
     user_service: str,
     target_audience: str,
     style: str,
-    sender_company: str = "",
-    sender_name: str = "",
+    sender_company: str,
+    sender_name: str,
+    website_details: str,
 ) -> str:
     """Build the user-message prompt for DeepSeek."""
-    # Lead context — make it VERY specific so messages feel personalized
+
     company = lead.get("company_name") or lead.get("author_username") or "this business"
+
+    # Fix the "Hi ABSENT" bug: use company name or "there" when DM name is missing
     dm_name = lead.get("dm_name") or ""
+    if not dm_name or dm_name == "ABSENT":
+        dm_name = ""  # Leave empty so we use "there" or company name
     dm_position = lead.get("dm_position") or ""
+    if dm_position == "ABSENT":
+        dm_position = ""
+
     website = lead.get("website_url") or ""
+    if website == "ABSENT":
+        website = ""
+
     email = lead.get("verified_email") or ""
+    if email == "ABSENT":
+        email = ""
+
     phone = lead.get("phone") or ""
-    address = lead.get("address") or ""
-    category = lead.get("category") or ""
-    rating = lead.get("rating")
-    review_count = lead.get("review_count")
-    intent = lead.get("intent_text") or lead.get("intent_level") or ""
+    if phone == "ABSENT":
+        phone = ""
+
+    # Determine greeting name
+    greeting_name = dm_name if dm_name else "there"
 
     style_instruction = STYLE_PROMPTS.get(style, STYLE_PROMPTS["david_ogilvy"])
 
-    # Build rich lead context so the AI can write a SPECIFIC, relevant message
-    lead_details = [f"BUSINESS NAME: {company}"]
+    # Build lead context — focus on what makes THIS business unique
+    lead_lines = [f"LEAD BUSINESS NAME: {company}"]
     if dm_name:
-        lead_details.append(f"CONTACT PERSON: {dm_name}" + (f", {dm_position}" if dm_position else ""))
+        lead_lines.append(f"CONTACT PERSON: {dm_name}" + (f" ({dm_position})" if dm_position else ""))
     if website:
-        lead_details.append(f"WEBSITE: {website}")
-    if email and email != "ABSENT":
-        lead_details.append(f"EMAIL: {email}")
-    if phone and phone != "ABSENT":
-        lead_details.append(f"PHONE: {phone}")
-    if address and address != "ABSENT":
-        lead_details.append(f"LOCATION: {address}")
-    if category and category != "ABSENT":
-        lead_details.append(f"BUSINESS TYPE: {category}")
-    if rating:
-        lead_details.append(f"RATING: {rating} stars" + (f" ({review_count} reviews)" if review_count else ""))
-    if intent and intent != "ABSENT":
-        lead_details.append(f"INTENT SIGNAL: {intent}")
+        lead_lines.append(f"WEBSITE: {website}")
+    if phone:
+        lead_lines.append(f"PHONE: {phone}")
 
-    lead_context = "\n".join(lead_details)
+    # Add website details (the unique part!)
+    if website_details:
+        lead_lines.append(f"DETAILS FROM THEIR WEBSITE: {website_details}")
+    else:
+        lead_lines.append("DETAILS FROM THEIR WEBSITE: (could not scrape — write a personalized message based on their business name and website URL)")
 
-    # Sender context — include company name for personalization
-    sender_lines = [f"SENDER'S SERVICE: {user_service}"]
+    lead_context = "\n".join(lead_lines)
+
+    # Sender context
+    sender_lines = []
     if sender_company:
-        sender_lines.append(f"SENDER'S COMPANY NAME: {sender_company}")
+        sender_lines.append(f"YOUR COMPANY: {sender_company}")
     if sender_name:
-        sender_lines.append(f"SENDER'S NAME: {sender_name}")
-    sender_lines.append(f"SENDER'S TARGET AUDIENCE: {target_audience or 'businesses like this one'}")
+        sender_lines.append(f"YOUR NAME: {sender_name}")
+    sender_lines.append(f"WHAT YOU SELL: {user_service}")
+    sender_lines.append(f"YOUR TARGET AUDIENCE: {target_audience or 'businesses like this one'}")
     sender_context = "\n".join(sender_lines)
 
-    # Sign-off instruction
-    sign_off = f' Sign off as "{sender_name or "Alex"} from {sender_company or "Bad Decision"}".' if (sender_company or sender_name) else ' Sign off as "Alex from Bad Decision".'
+    # Sign-off
+    if sender_name and sender_company:
+        sign_off = f" Sign off as '{sender_name} from {sender_company}'."
+    elif sender_company:
+        sign_off = f" Sign off as 'the team at {sender_company}'."
+    elif sender_name:
+        sign_off = f" Sign off as '{sender_name}'."
+    else:
+        sign_off = " Sign off as 'Alex from Bad Decision'."
 
     char_rule = f"""CHARACTER LIMITS (CRITICAL):
 - email_subject: {SUBJECT_MIN}-{SUBJECT_MAX} characters
@@ -151,48 +249,55 @@ def _build_prompt(
 - social_message: {MIN_CHARS}-{MAX_CHARS} characters
 - call_script: {MIN_CHARS}-{MAX_CHARS} characters
 
-COMPLETENESS RULE (MOST IMPORTANT):
-Every message MUST be COMPLETE — end with proper punctuation (. ! or ?).
+COMPLETENESS RULE:
+Every message MUST end with proper punctuation (. ! or ?).
 NEVER cut off a sentence mid-way to meet the character count.
 
-PERSONALIZATION RULE (CRITICAL):
-Every message MUST reference the lead's SPECIFIC business by name ({company}).
-The message must make it clear that it was written for {company} specifically,
-not a generic template. Reference their website, location, or business type
-when relevant. Do NOT write generic messages that could apply to any business.
+OUTREACH CONTEXT (CRITICAL):
+These are COLD OUTREACH messages from YOU ({sender_company or 'your company'}) TO the lead business ({company}).
+The goal is to start a conversation that could lead to a sale of YOUR service.
+Do NOT write generic content. Do NOT mention star ratings, review counts, or platform data.
+Use the DETAILS FROM THEIR WEBSITE to make each message feel like it was written specifically for {company}.
+
+GREETING RULE:
+- Start emails and social DMs with "Hi {greeting_name}," (use the contact person's name if available, otherwise use "there")
+- NEVER use "Hi ABSENT" or any placeholder — if no name is available, use "Hi there," or "Hi {company} team,"
 
 The email_subject is SEPARATE from the email_message body."""
 
-    return f"""You are an expert copywriter writing personalized outreach messages.
+    return f"""You are an expert copywriter writing personalized COLD OUTREACH messages.
 
 {style_instruction}
 
-LEAD INFORMATION (the business you are writing TO):
+You are writing on behalf of YOUR business to pitch YOUR service to the LEAD business.
+
+LEAD INFORMATION (the business you are pitching TO):
 {lead_context}
 
-YOUR INFORMATION (the business you are writing FROM):
+YOUR INFORMATION (the business pitching):
 {sender_context}
 
 {char_rule}
 
 TASK:
-Write FOUR outputs for this lead. Each must be ready-to-send with NO placeholders
-(no [Your Name], no [Company], etc.) — use the actual data above.
+Write FOUR outputs. Each must be ready-to-send with NO placeholders.
 
 1. "email_subject" — a subject line for the cold email. {SUBJECT_MIN}-{SUBJECT_MAX} chars.
-   Must reference {company} or their industry specifically. Curiosity-driven, NOT spammy.
+   Must reference something specific about {company} from their website details.
+   Curiosity-driven, NOT spammy, NOT clickbait.
 
-2. "email_message" — a cold email body (NOT including the subject). {MIN_CHARS}-{MAX_CHARS} chars.
-   Start with a greeting using "{dm_name or "there"}". The body MUST connect YOUR service
-   to THEIR specific business situation. Reference their business name, website, or location.{sign_off}
+2. "email_message" — a cold email body. {MIN_CHARS}-{MAX_CHARS} chars.
+   Start with "Hi {greeting_name},". The body MUST connect YOUR service to something
+   specific you found on THEIR website. Reference a real detail about their business.{sign_off}
+   Do NOT mention star ratings, review counts, or generic platform data.
 
 3. "social_message" — a LinkedIn or Instagram DM. {MIN_CHARS}-{MAX_CHARS} chars.
-   More casual tone. Must mention {company} by name. Reference something specific
-   about their business (website, location, or business type).
+   More casual tone. Must mention {company} and reference something specific from their website.
+   Do NOT mention star ratings or review counts.
 
 4. "call_script" — a phone call opening script (first 30 seconds). {MIN_CHARS}-{MAX_CHARS} chars.
    Include a greeting, mention you're calling about {company} specifically,
-   give a reason for calling tied to their business, and ask a permission question.
+   reference something from their website, and ask a permission question.
 
 Return ONLY a JSON object with exactly these keys (no markdown, no code fences):
 {{
@@ -204,33 +309,26 @@ Return ONLY a JSON object with exactly these keys (no markdown, no code fences):
 
 
 # ============================================================
-# CHARACTER ENFORCEMENT — completeness-first
+# CHARACTER ENFORCEMENT
 # ============================================================
 def _is_complete(message: str) -> bool:
-    """Check if a message ends with proper punctuation."""
     if not message:
         return False
     stripped = message.rstrip()
-    if not stripped:
-        return False
-    return stripped[-1] in '.!?'
+    return bool(stripped) and stripped[-1] in '.!?'
 
 def _enforce_length(message: str, kind: str = "message") -> str:
-    """Force a message toward the [MIN_CHARS, MAX_CHARS] window. Never cut mid-sentence."""
     if not message:
         return ""
-
     message = message.strip()
     if not message:
         return ""
 
     if MIN_CHARS <= len(message) <= MAX_CHARS:
         return message
-
     if TOLERANCE_MIN <= len(message) <= TOLERANCE_MAX and _is_complete(message):
         return message
 
-    # TOO LONG → trim at sentence boundary
     if len(message) > MAX_CHARS:
         cut_zone = message[:MAX_CHARS]
         boundary = -1
@@ -238,49 +336,26 @@ def _enforce_length(message: str, kind: str = "message") -> str:
             idx = cut_zone.rfind(punct)
             if idx > boundary:
                 boundary = idx
-
         if boundary >= TOLERANCE_MIN - 50:
             trimmed = message[:boundary + 1].rstrip()
             if TOLERANCE_MIN <= len(trimmed) <= TOLERANCE_MAX:
                 return trimmed
-            # Try extending to next sentence boundary
-            next_boundary = -1
-            for punct in ['. ', '! ', '? ']:
-                idx = message.find(punct, boundary + 1)
-                if idx != -1 and (next_boundary == -1 or idx < next_boundary):
-                    next_boundary = idx
-            if next_boundary != -1 and next_boundary < TOLERANCE_MAX:
-                extended = message[:next_boundary + 1].rstrip()
-                if len(extended) <= TOLERANCE_MAX:
-                    return extended
-            if len(message) <= TOLERANCE_MAX:
-                return message
-            return message[:TOLERANCE_MAX - 3].rstrip() + "..."
-        else:
-            if len(message) <= TOLERANCE_MAX:
-                return message
-            return message[:TOLERANCE_MAX - 3].rstrip() + "..."
+        if len(message) <= TOLERANCE_MAX:
+            return message
+        return message[:TOLERANCE_MAX - 3].rstrip() + "..."
 
-    # TOO SHORT → append CTA
     if len(message) < MIN_CHARS:
         if not _is_complete(message):
             message += "."
-
         cta_options = [
             " Reply to this message and I'll send over a short breakdown.",
             " Hit reply with 'yes' and I'll forward the details today.",
             " Want me to send the full breakdown? Just reply here.",
             " Let me know a good time and I'll walk you through it.",
-            " Reply 'send it' and I'll forward everything you need.",
         ]
         for cta in cta_options:
             candidate = message + cta
             if MIN_CHARS <= len(candidate) <= MAX_CHARS:
-                return candidate
-        short_ctas = [" Reply to learn more.", " Hit reply with 'yes'.", " Want the details? Reply here."]
-        for cta in short_ctas:
-            candidate = message + cta
-            if TOLERANCE_MIN <= len(candidate) <= TOLERANCE_MAX:
                 return candidate
         return message
 
@@ -291,12 +366,9 @@ def _enforce_length(message: str, kind: str = "message") -> str:
 # JSON EXTRACTION
 # ============================================================
 def _extract_json(content: str) -> Dict[str, Any]:
-    """Extract a JSON object from the model's response."""
     if not content:
         return {}
-
     content = content.strip()
-    # Strip markdown code fences
     if content.startswith("```"):
         lines = content.split("\n")
         if lines[0].strip().startswith("```"):
@@ -304,19 +376,16 @@ def _extract_json(content: str) -> Dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         content = "\n".join(lines).strip()
-
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
-
     json_match = re.search(r'\{[\s\S]*\}', content)
     if json_match:
         try:
             return json.loads(json_match.group(0))
         except json.JSONDecodeError:
             pass
-
     return {}
 
 
@@ -333,16 +402,28 @@ async def generate_outreach_messages(
 ) -> Dict[str, str]:
     """
     Generate personalized outreach messages for a single lead.
-    Uses deepseek-chat (flagship, non-thinking) for fast generation.
+    Scrapes the lead's website for unique details to personalize the message.
     """
     if not user_service:
         raise ValueError("user_service is required")
 
     style = copywriting_style if copywriting_style in STYLE_PROMPTS else "david_ogilvy"
-    prompt = _build_prompt(lead, user_service, target_audience, style, sender_company, sender_name)
+
+    # Scrape the lead's website for unique personalization details
+    website_url = lead.get("website_url") or ""
+    if website_url and website_url != "ABSENT":
+        print(f"[OUTREACH] Scraping website for {lead.get('company_name', 'unknown')}: {website_url}")
+        website_details = await _scrape_lead_website(website_url)
+        if website_details:
+            print(f"[OUTREACH] Found website details ({len(website_details)} chars)")
+        else:
+            print(f"[OUTREACH] No website details found")
+    else:
+        website_details = ""
+
+    prompt = _build_prompt(lead, user_service, target_audience, style, sender_company, sender_name, website_details)
 
     # ---------- PASS 1: initial generation ----------
-    # deepseek-chat supports response_format: json_object for reliable JSON output
     print(f"[OUTREACH] Generating with model={MODEL} for lead: {lead.get('company_name', 'unknown')}")
     response = await execute_llm_payload({
         "model": MODEL,
@@ -351,10 +432,10 @@ async def generate_outreach_messages(
                 "role": "system",
                 "content": (
                     "You are an expert direct-response copywriter who writes personalized "
-                    "outreach messages. You ALWAYS respond with a valid JSON object. "
-                    "Your messages are always complete and specific to each lead. "
-                    "You hit the target character count by adjusting detail and wording, "
-                    "never by truncating."
+                    "COLD OUTREACH messages. You ALWAYS respond with a valid JSON object. "
+                    "Your messages are always complete, personalized, and written as outreach "
+                    "from one business to another. You never include generic platform data "
+                    "like star ratings or review counts. You never use placeholder text."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -365,7 +446,6 @@ async def generate_outreach_messages(
 
     content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
     if not content:
-        print(f"[OUTREACH] WARNING: Empty content from model.")
         reasoning = response.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         if reasoning:
             content = reasoning
@@ -377,6 +457,25 @@ async def generate_outreach_messages(
     call_msg = (parsed.get("call_script") or "").strip()
     email_subj = (parsed.get("email_subject") or "").strip()
 
+    # Fix any "Hi ABSENT" that slipped through
+    for msg_attr in ['email_msg', 'social_msg', 'call_msg']:
+        msg = locals()[msg_attr]
+        if msg and 'ABSENT' in msg:
+            msg = msg.replace('Hi ABSENT,', 'Hi there,')
+            msg = msg.replace('Hi ABSENT', 'Hi there')
+            msg = msg.replace('ABSENT', 'there')
+            locals()[msg_attr]  # can't modify locals directly, handle below
+
+    # Actually fix them properly
+    if email_msg and 'ABSENT' in email_msg:
+        email_msg = email_msg.replace('Hi ABSENT,', 'Hi there,').replace('Hi ABSENT', 'Hi there').replace('ABSENT', 'there')
+    if social_msg and 'ABSENT' in social_msg:
+        social_msg = social_msg.replace('Hi ABSENT,', 'Hi there,').replace('Hi ABSENT', 'Hi there').replace('ABSENT', 'there')
+    if call_msg and 'ABSENT' in call_msg:
+        call_msg = call_msg.replace('Hi ABSENT,', 'Hi there,').replace('Hi ABSENT', 'Hi there').replace('ABSENT', 'there')
+    if email_subj and 'ABSENT' in email_subj:
+        email_subj = email_subj.replace('ABSENT', lead.get("company_name") or "your business")
+
     print(f"[OUTREACH] Initial lengths: subject={len(email_subj)}, email={len(email_msg)}, social={len(social_msg)}, call={len(call_msg)}")
 
     # ---------- PASS 2: retry if significantly out of range or incomplete ----------
@@ -385,13 +484,13 @@ async def generate_outreach_messages(
             return current
         if not current:
             return current
-
         company_name = lead.get("company_name") or "this business"
         retry_prompt = (
             f"The {kind} you just wrote is {len(current)} characters long and "
             f"{'incomplete' if not _is_complete(current) else 'out of range'}. "
             f"It MUST be between {MIN_CHARS} and {MAX_CHARS} characters AND complete. "
-            f"It MUST reference {company_name} specifically. "
+            f"It MUST be a COLD OUTREACH message referencing {company_name} specifically. "
+            f"Do NOT use 'ABSENT' as a name — use 'there' or the company name. "
             f"Rewrite ONLY this {kind}. Return JSON: {{\"{kind}\": \"...\"}}"
         )
         try:
@@ -407,13 +506,12 @@ async def generate_outreach_messages(
             retry_content = retry_response.get("choices", [{}])[0].get("message", {}).get("content", "")
             retry_parsed = _extract_json(retry_content)
             result = (retry_parsed.get(kind) or "").strip()
-            if result:
+            if result and 'ABSENT' not in result:
                 return result
         except Exception as e:
             print(f"[OUTREACH] Regeneration failed for {kind}: {e}")
         return current
 
-    # Only regenerate if significantly out of range OR incomplete
     if (len(email_msg) < TOLERANCE_MIN or len(email_msg) > TOLERANCE_MAX or not _is_complete(email_msg)) and email_msg:
         print(f"[OUTREACH] Regenerating email_message (len={len(email_msg)}, complete={_is_complete(email_msg)})")
         email_msg = await _regenerate("email_message", email_msg)
@@ -428,13 +526,6 @@ async def generate_outreach_messages(
     email_final = _enforce_length(email_msg, "email")
     social_final = _enforce_length(social_msg, "social")
     call_final = _enforce_length(call_msg, "call")
-
-    if email_final != email_msg:
-        print(f"[OUTREACH] email_message post-processed: {len(email_msg)} → {len(email_final)} chars")
-    if social_final != social_msg:
-        print(f"[OUTREACH] social_message post-processed: {len(social_msg)} → {len(social_final)} chars")
-    if call_final != call_msg:
-        print(f"[OUTREACH] call_script post-processed: {len(call_msg)} → {len(call_final)} chars")
 
     # Subject line enforcement
     if email_subj:

@@ -58,7 +58,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -858,13 +858,22 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
 
     # 2. Fetch user settings
     user_id = leads[0].get("user_id")
-    profile_result = (
-        db.table("profiles")
-        .select("user_service, target_audience, copywriting_style")
-        .eq("id", user_id)
-        .limit(1)
-        .execute()
-    )
+    try:
+        profile_result = (
+            db.table("profiles")
+            .select("user_service, target_audience, copywriting_style, company_name, sender_name")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        profile_result = (
+            db.table("profiles")
+            .select("user_service, target_audience, copywriting_style")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
     if not profile_result.data or not profile_result.data[0].get("user_service"):
         raise HTTPException(
             status_code=400,
