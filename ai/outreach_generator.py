@@ -106,11 +106,12 @@ def _build_prompt(lead: Dict[str, Any], user_service: str, target_audience: str,
 - Who the sender's ideal customer is: {target_audience or 'businesses like this one'}"""
 
     char_rule = f"""CHARACTER LIMIT (CRITICAL):
-Every message MUST be between {MIN_CHARS} and {MAX_CHARS} characters (inclusive).
+Every message body MUST be between {MIN_CHARS} and {MAX_CHARS} characters (inclusive).
 Count every character including spaces and punctuation.
 - If a message is under {MIN_CHARS} chars, expand it with more specific detail.
 - If a message is over {MAX_CHARS} chars, trim it — but keep it complete and readable.
-Do NOT include subject lines, greetings-only lines, or signatures as separate fields.
+The email_subject is SEPARATE from the character count — it should be 40-70 chars.
+Do NOT include the subject line inside the email_message body.
 The message body itself must hit the character target."""
 
     return f"""You are an expert copywriter writing personalized outreach messages.
@@ -127,26 +128,31 @@ TASK:
 Write THREE distinct outreach messages for this lead. Each must be a complete,
 ready-to-send message with NO placeholders (no [Your Name], no [Company], etc.).
 
-1. "email_message" — a cold email. Include a greeting using the DM name if known,
+1. "email_subject" — a subject line for the cold email. 40-70 characters.
+   Curiosity-driven, specific to the lead, NOT spammy. No clickbait.
+
+2. "email_message" — a cold email. Include a greeting using the DM name if known,
    a body that connects the sender's service to the lead's situation, and a soft
    call-to-action. Sign off as "Alex from Bad Decision" (or omit sign-off if it
-   pushes you over the limit).
+   pushes you over the limit). Do NOT include the subject line in this field.
 
-2. "social_message" — a LinkedIn or Instagram DM. More casual, shorter sentences,
+3. "social_message" — a LinkedIn or Instagram DM. More casual, shorter sentences,
    no subject line. Can reference the lead's website or business specifically.
 
-3. "call_script" — a phone call opening script (what to say in the first 30 seconds).
+4. "call_script" — a phone call opening script (what to say in the first 30 seconds).
    Include a greeting, a reason for calling tied to the lead's business, and a
    permission-based question to continue the conversation.
 
 Return ONLY a JSON object with exactly these keys:
 {{
+  "email_subject": "...",
   "email_message": "...",
   "social_message": "...",
   "call_script": "..."
 }}
 
-Remember: each of the three strings MUST be between {MIN_CHARS} and {MAX_CHARS} characters."""
+Remember: email_message, social_message, and call_script MUST each be between {MIN_CHARS} and {MAX_CHARS} characters.
+email_subject MUST be between 40 and 70 characters."""
 
 
 # ============================================================
@@ -287,6 +293,7 @@ async def generate_outreach_messages(
     email_msg = (parsed.get("email_message") or "").strip()
     social_msg = (parsed.get("social_message") or "").strip()
     call_msg = (parsed.get("call_script") or "").strip()
+    email_subj = (parsed.get("email_subject") or "").strip()
 
     # ---------- PASS 2: retry any messages that are out of range ----------
     async def _regenerate(kind: str, current: str) -> str:
@@ -344,7 +351,26 @@ async def generate_outreach_messages(
     if call_final != call_msg:
         print(f"[OUTREACH] call_script post-processed: {len(call_msg)} → {len(call_final)} chars")
 
+    # Enforce subject line length (40-70 chars)
+    if email_subj:
+        if len(email_subj) > 70:
+            # Trim at word boundary
+            cut = email_subj[:70]
+            last_space = cut.rfind(" ")
+            if last_space > 30:
+                email_subj = cut[:last_space].rstrip()
+            else:
+                email_subj = cut.rstrip()
+        elif len(email_subj) < 40 and len(email_subj) > 0:
+            # Try to extend with a power word
+            extensions = [" — quick question", " (30 seconds)", " — ideas inside", " worth a look?"]
+            for ext in extensions:
+                if len(email_subj) + len(ext) <= 70 and len(email_subj) + len(ext) >= 40:
+                    email_subj += ext
+                    break
+
     return {
+        "email_subject": email_subj,
         "email_message": email_final,
         "social_message": social_final,
         "call_script": call_final,

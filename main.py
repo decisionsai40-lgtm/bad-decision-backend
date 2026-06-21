@@ -761,6 +761,7 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
 
     # 4. Save the messages to the database
     db.table("workspace_leads").update({
+        "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
         "outreach_email": outreach.get("email_message", "ABSENT"),
         "outreach_social": outreach.get("social_message", "ABSENT"),
         "outreach_call": outreach.get("call_script", "ABSENT"),
@@ -768,6 +769,7 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
 
     return {
         "success": True,
+        "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
         "outreach_email": outreach.get("email_message", "ABSENT"),
         "outreach_social": outreach.get("social_message", "ABSENT"),
         "outreach_call": outreach.get("call_script", "ABSENT"),
@@ -857,6 +859,7 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
                 lead, user_service, target_audience, copywriting_style
             )
             db.table("workspace_leads").update({
+                "outreach_email_subject": outreach.get("email_subject", "ABSENT"),
                 "outreach_email": outreach.get("email_message", "ABSENT"),
                 "outreach_social": outreach.get("social_message", "ABSENT"),
                 "outreach_call": outreach.get("call_script", "ABSENT"),

@@ -14,6 +14,7 @@
 ALTER TABLE workspace_leads ADD COLUMN IF NOT EXISTS outreach_email TEXT;
 ALTER TABLE workspace_leads ADD COLUMN IF NOT EXISTS outreach_social TEXT;
 ALTER TABLE workspace_leads ADD COLUMN IF NOT EXISTS outreach_call TEXT;
+ALTER TABLE workspace_leads ADD COLUMN IF NOT EXISTS outreach_email_subject TEXT;
 
 -- ============================================================
 -- 2. PROFILES — user settings for outreach personalization
