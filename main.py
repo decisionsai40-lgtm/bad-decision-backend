@@ -653,7 +653,7 @@ async def get_credit_balance(
                 )
                 if profile.data:
                     p = profile.data[0]
-                    from email.senders import send_credit_low_email
+                    from mailer.senders import send_credit_low_email
                     await send_credit_low_email(
                         to_email=p["email"],
                         full_name=p.get("full_name", ""),
@@ -1142,7 +1142,7 @@ class PaymentReceiptEmailRequest(BaseModel):
 async def send_welcome_email_endpoint(req: SendEmailRequest, x_api_secret: Optional[str] = Header(None)):
     """Send the welcome email. Called by the Clerk webhook after handle_new_user."""
     verify_api_secret(x_api_secret)
-    from email.senders import send_welcome_email
+    from mailer.senders import send_welcome_email
     success = await send_welcome_email(req.email, req.full_name)
     return {"success": success}
 
@@ -1151,7 +1151,7 @@ async def send_welcome_email_endpoint(req: SendEmailRequest, x_api_secret: Optio
 async def send_payment_receipt_endpoint(req: PaymentReceiptEmailRequest, x_api_secret: Optional[str] = Header(None)):
     """Send a payment receipt. Called by the Paystack webhook after add_credits."""
     verify_api_secret(x_api_secret)
-    from email.senders import send_payment_receipt_email
+    from mailer.senders import send_payment_receipt_email
     success = await send_payment_receipt_email(
         to_email=req.email,
         full_name=req.full_name,

@@ -5,8 +5,8 @@ High-level functions that compose + send each transactional email type.
 Each function is best-effort: logs on failure but never raises.
 """
 
-from email.resend_client import resend
-from email.templates import (
+from mailer.resend_client import resend
+from mailer.templates import (
     render_welcome_email,
     render_payment_receipt_email,
     render_credit_low_email,

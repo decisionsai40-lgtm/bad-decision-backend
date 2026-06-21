@@ -6,7 +6,7 @@ Only initializes if RESEND_API_KEY is set — silent no-op otherwise
 (so dev environments without a key don't crash).
 
 Usage:
-    from email.resend_client import resend
+    from mailer.resend_client import resend
     await resend.send_email(
         to_email="user@example.com",
         subject="Welcome to Bad Decision",
