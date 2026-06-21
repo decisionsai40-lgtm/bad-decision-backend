@@ -344,10 +344,14 @@ async def generate_outreach_messages(
     copywriting_style: str,
     sender_company: str = "",
     sender_name: str = "",
+    skip_regeneration: bool = False,
 ) -> Dict[str, str]:
     """
     Generate personalized outreach messages for a single lead.
     Passes the lead's website URL + social media URLs to DeepSeek — NO scraping.
+
+    skip_regeneration: If True, skip the retry pass (for batch mode — faster).
+                       Just do initial generation + post-processing.
     """
     if not user_service:
         raise ValueError("user_service is required")
@@ -362,8 +366,10 @@ async def generate_outreach_messages(
     greeting_name = dm_name if dm_name else "there"
 
     # ---------- PASS 1: initial generation ----------
+    # max_tokens prevents DeepSeek from truncating the JSON (which causes empty fields)
     company_name = lead.get("company_name") or "unknown"
-    print(f"[OUTREACH] Generating with model={MODEL} for lead: {company_name}")
+    mode_label = "batch" if skip_regeneration else "single"
+    print(f"[OUTREACH] Generating ({mode_label}) with model={MODEL} for lead: {company_name}")
     response = await execute_llm_payload({
         "model": MODEL,
         "messages": [
@@ -375,13 +381,15 @@ async def generate_outreach_messages(
                     "Your messages are always complete, personalized, and written as outreach "
                     "from one business to another. You never include generic platform data "
                     "like star ratings or review counts. You never use placeholder text. "
-                    "You MUST fill in ALL four fields — never leave any empty."
+                    "You MUST fill in ALL four fields — never leave any empty. "
+                    "Each message body must be 500-530 characters. Keep messages concise."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.7,
+        "max_tokens": 3000,  # Prevent truncation — 4 messages × ~600 chars + JSON overhead
     })
 
     content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -449,15 +457,19 @@ async def generate_outreach_messages(
         return current
 
     # Regenerate any that are empty, out of range, or incomplete
-    if not email_msg or len(email_msg) < TOLERANCE_MIN or len(email_msg) > TOLERANCE_MAX or not _is_complete(email_msg):
-        print(f"[OUTREACH] Regenerating email_message (len={len(email_msg)}, complete={_is_complete(email_msg)})")
-        email_msg = await _regenerate("email_message", email_msg)
-    if not social_msg or len(social_msg) < TOLERANCE_MIN or len(social_msg) > TOLERANCE_MAX or not _is_complete(social_msg):
-        print(f"[OUTREACH] Regenerating social_message (len={len(social_msg)}, complete={_is_complete(social_msg)})")
-        social_msg = await _regenerate("social_message", social_msg)
-    if not call_msg or len(call_msg) < TOLERANCE_MIN or len(call_msg) > TOLERANCE_MAX or not _is_complete(call_msg):
-        print(f"[OUTREACH] Regenerating call_script (len={len(call_msg)}, complete={_is_complete(call_msg)})")
-        call_msg = await _regenerate("call_script", call_msg)
+    # SKIP regeneration in batch mode for speed (post-processing will handle length)
+    if not skip_regeneration:
+        if not email_msg or len(email_msg) < TOLERANCE_MIN or len(email_msg) > TOLERANCE_MAX or not _is_complete(email_msg):
+            print(f"[OUTREACH] Regenerating email_message (len={len(email_msg)}, complete={_is_complete(email_msg)})")
+            email_msg = await _regenerate("email_message", email_msg)
+        if not social_msg or len(social_msg) < TOLERANCE_MIN or len(social_msg) > TOLERANCE_MAX or not _is_complete(social_msg):
+            print(f"[OUTREACH] Regenerating social_message (len={len(social_msg)}, complete={_is_complete(social_msg)})")
+            social_msg = await _regenerate("social_message", social_msg)
+        if not call_msg or len(call_msg) < TOLERANCE_MIN or len(call_msg) > TOLERANCE_MAX or not _is_complete(call_msg):
+            print(f"[OUTREACH] Regenerating call_script (len={len(call_msg)}, complete={_is_complete(call_msg)})")
+            call_msg = await _regenerate("call_script", call_msg)
+    else:
+        print(f"[OUTREACH] Skipping regeneration (batch mode) — using post-processing only")
 
     # ---------- FINAL ENFORCEMENT ----------
     email_final = _enforce_length(email_msg, "email")

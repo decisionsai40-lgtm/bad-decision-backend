@@ -950,7 +950,8 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
 
         try:
             outreach = await generate_outreach_messages(
-                lead, user_service, target_audience, copywriting_style, sender_company, sender_name
+                lead, user_service, target_audience, copywriting_style, sender_company, sender_name,
+                skip_regeneration=True,  # Batch mode: skip regeneration for speed
             )
             db.table("workspace_leads").update({
                 "outreach_email": outreach.get("email_message", "ABSENT"),
