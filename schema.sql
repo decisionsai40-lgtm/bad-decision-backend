@@ -224,9 +224,11 @@ BEGIN
   VALUES (p_clerk_id, p_email, p_full_name, 'free', COALESCE(NULLIF(p_country, ''), 'US'))
   ON CONFLICT (id) DO NOTHING;
 
-  -- Insert credit_balances with 100 free credits + 1 month expiry
+  -- Insert credit_balances with 100 free credits + 30-day expiry.
+  -- total_purchased is 0 because these are free credits, not purchased.
+  -- (total_purchased only increments on real Paystack purchases.)
   INSERT INTO credit_balances (user_id, credits_balance, credits_reserved, total_purchased, credits_expiry, last_renewed_at)
-  VALUES (p_clerk_id, 100, 0, 50, now() + interval '30 days', now())
+  VALUES (p_clerk_id, 100, 0, 0, now() + interval '30 days', now())
   ON CONFLICT (user_id) DO NOTHING;
 
   INSERT INTO credit_transactions (user_id, amount, transaction_type, description, reference_id)
@@ -464,10 +466,11 @@ BEGIN
         updated_at = now()
     WHERE user_id = p_user_id;
 
-    -- For free tier users, grant 50 new credits with 30-day expiry
+    -- For free tier users, grant 100 new credits with 30-day expiry.
+    -- (Matches the signup bonus in handle_new_user — 100, not 50.)
     IF tier_val = 'free' THEN
       UPDATE credit_balances
-      SET credits_balance = 50,
+      SET credits_balance = 100,
           credits_expiry = now() + interval '30 days',
           last_renewed_at = now(),
           updated_at = now()
@@ -487,7 +490,7 @@ BEGIN
   -- Check if free user hasn't been renewed in 30+ days (even if expiry is NULL)
   IF tier_val = 'free' AND cb_record.last_renewed_at IS NOT NULL AND cb_record.last_renewed_at < now() - interval '30 days' THEN
     UPDATE credit_balances
-    SET credits_balance = 50,
+    SET credits_balance = 100,
         credits_expiry = now() + interval '30 days',
         last_renewed_at = now(),
         updated_at = now()

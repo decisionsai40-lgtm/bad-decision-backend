@@ -245,31 +245,18 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         if profile_result.data and len(profile_result.data) > 0:
             user_tier = profile_result.data[0].get("tier", "free")
         else:
-            # No profile found — auto-create one (defensive: in case Clerk webhook
-            # hasn't fired yet or failed). This prevents 500 errors.
-            # Use the user_id as a unique email placeholder to avoid UNIQUE constraint
-            # conflicts (email column is UNIQUE NOT NULL).
-            print(f"[API] No profile found for user {req.user_id} — auto-creating default profile")
-            try:
-                db.rpc("handle_new_user", {
-                    "p_clerk_id": req.user_id,
-                    "p_email": f"{req.user_id}@clerk.placeholder",
-                    "p_full_name": "",
-                    "p_country": "US",
-                }).execute()
-                print(f"[API] Auto-created profile + 50 free credits via handle_new_user RPC")
-            except Exception as insert_err:
-                print(f"[API] handle_new_user RPC failed: {insert_err}")
-                # Last resort: insert profile directly with a unique email
-                try:
-                    db.table("profiles").insert({
-                        "id": req.user_id,
-                        "email": f"{req.user_id}@clerk.placeholder",
-                        "full_name": "",
-                        "tier": "free",
-                    }).execute()
-                except Exception as direct_err:
-                    print(f"[API] Direct profile insert also failed: {direct_err}")
+            # No profile found. Don't auto-create one with a fake email — that
+            # would break future Paystack receipts, Resend transactional emails,
+            # and forgot-password flows. Instead, return a clear error so the
+            # user can sign out and sign back in (which retriggers the Clerk
+            # webhook that should have created the profile).
+            print(f"[API] No profile found for user {req.user_id} — refusing to auto-create with fake email")
+            raise HTTPException(
+                status_code=403,
+                detail="Your profile is not set up yet. Please sign out and sign back in. If the problem persists, contact support.",
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[API] Warning: could not fetch user tier, defaulting to free: {e}")
 
@@ -281,7 +268,6 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         )
 
     # === CHECK CREDIT BALANCE ===
-    # Auto-create credit_balances row if it doesn't exist (defensive)
     try:
         ledger_result = (
             db.table("credit_balances")
@@ -290,33 +276,14 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
             .limit(1)
             .execute()
         )
-        if ledger_result.data and len(ledger_result.data) > 0:
-            balance = ledger_result.data[0].get("credits_balance", 0)
-        else:
-            # No credit_balances row — the handle_new_user RPC above should have
-            # created it with 50 free credits. If it didn't (RPC failed), try
-            # creating credit_balances directly with 50 credits (matching the
-            # signup bonus). This prevents the race condition where the backend
-            # creates a 0-credit row before the frontend can create a 50-credit row.
-            print(f"[API] No credit_balances row for user {req.user_id} — creating with 50 free credits")
-            try:
-                db.table("credit_balances").insert({
-                    "user_id": req.user_id,
-                    "credits_balance": 100,
-                    "credits_reserved": 0,
-                    "total_purchased": 50,
-                }).execute()
-                # Also log the signup bonus transaction
-                db.table("credit_transactions").insert({
-                    "user_id": req.user_id,
-                    "amount": 50,
-                    "transaction_type": "signup_bonus",
-                    "description": "50 free credits for signing up",
-                    "reference_id": f"signup_{req.user_id}",
-                }).execute()
-            except Exception as insert_err:
-                print(f"[API] Could not auto-create credit_balances: {insert_err}")
-            balance = 50  # Assume 50 if we just created it
+        if not (ledger_result.data and len(ledger_result.data) > 0):
+            # No credit_balances row — same logic as above. The Clerk webhook
+            # should have created it. Refuse to silently fabricate one.
+            raise HTTPException(
+                status_code=403,
+                detail="Your account is not fully set up yet. Please sign out and sign back in.",
+            )
+        balance = ledger_result.data[0].get("credits_balance", 0)
 
         if balance < req.credits_reserved:
             raise HTTPException(
@@ -327,8 +294,31 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
         raise
     except Exception as e:
         print(f"[API] Warning: could not verify credit balance: {e}")
+        raise HTTPException(status_code=500, detail="Could not verify credit balance. Please try again.")
 
-    # === INSERT TASK ===
+    # === RESERVE CREDITS FIRST (lock them before creating the task) ===
+    # This avoids orphan "failed" task rows if reservation fails. If the RPC
+    # returns False (insufficient balance / row missing), we 402 here without
+    # ever inserting a task row.
+    try:
+        reserve_ok = db.rpc("reserve_credits", {
+            "p_user_id": req.user_id,
+            "p_amount": req.credits_reserved,
+            "p_description": f"Credits reserved for {req.task_type} search: '{req.query[:50]}'",
+        }).execute()
+
+        if not reserve_ok.data:
+            raise HTTPException(
+                status_code=402,
+                detail="Could not reserve credits. Please check your balance."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] reserve_credits RPC failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not reserve credits. Please try again.")
+
+    # === INSERT TASK (only after credits are successfully reserved) ===
     insert_data = {
         "user_id": req.user_id,
         "task_type": req.task_type,
@@ -343,31 +333,21 @@ async def create_task(req: TaskCreateRequest, x_api_secret: Optional[str] = Head
     if req.state_region:
         insert_data["state_region"] = req.state_region
 
-    result = db.table("tasks").insert(insert_data).execute()
-
-    # === RESERVE CREDITS (lock them) ===
     try:
-        reserve_ok = db.rpc("reserve_credits", {
-            "p_user_id": req.user_id,
-            "p_amount": req.credits_reserved,
-            "p_description": f"Credits reserved for {req.task_type} search: '{req.query[:50]}'",
-        }).execute()
-
-        if not reserve_ok.data:
-            # Reserve failed — cancel the task
-            db.table("tasks").update({
-                "status": "failed",
-                "error_message": "Could not reserve credits",
-            }).eq("id", result.data[0]["id"]).execute()
-            raise HTTPException(
-                status_code=402,
-                detail="Could not reserve credits. Please check your balance."
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[API] Warning: could not reserve credits: {e}")
+        result = db.table("tasks").insert(insert_data).execute()
+    except Exception as insert_err:
+        # Task insert failed AFTER credits were reserved. Refund immediately
+        # so the user isn't left with locked credits and no task.
+        print(f"[API] Task insert failed after reservation — refunding: {insert_err}")
+        try:
+            db.rpc("refund_credits", {
+                "p_user_id": req.user_id,
+                "p_amount": req.credits_reserved,
+                "p_description": f"Refund: task insert failed for {req.task_type} search",
+            }).execute()
+        except Exception as refund_err:
+            print(f"[API] CRITICAL: refund after insert failure also failed: {refund_err}")
+        raise HTTPException(status_code=500, detail="Could not create task. Your credits have been refunded.")
 
     return {"success": True, "task": result.data}
 
@@ -557,7 +537,13 @@ async def get_credit_balance(
     x_api_secret: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
 ):
-    """Get a user's credit balance. user_id is Clerk ID (TEXT string)."""
+    """Get a user's credit balance. user_id is Clerk ID (TEXT string).
+
+    Also runs renew_free_credits RPC to enforce the 30-day expiry +
+    monthly renewal for free-tier users. This is the canonical place
+    that expiry is enforced — every time the dashboard loads, we check
+    if the user's free credits have expired and renew them if so.
+    """
     verify_api_secret(x_api_secret)
 
     if x_user_id and user_id != x_user_id:
@@ -565,6 +551,15 @@ async def get_credit_balance(
 
     from supabase_client import get_supabase
     db = get_supabase()
+
+    # Renew free credits if expired (30-day cycle for free-tier users).
+    # Safe to call on every request — the RPC is idempotent and only
+    # modifies the row if expiry has actually passed.
+    try:
+        db.rpc("renew_free_credits", {"p_user_id": user_id}).execute()
+    except Exception as e:
+        print(f"[API] Warning: renew_free_credits RPC failed for {user_id}: {e}")
+
     result = (
         db.table("credit_balances")
         .select("credits_balance, credits_reserved, total_purchased")

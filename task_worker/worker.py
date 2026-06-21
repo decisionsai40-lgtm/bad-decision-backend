@@ -14,7 +14,7 @@ from config import (
     CREDIT_COST_SCAN, CREDIT_COST_DEEP, CREDIT_COST_SMTP,
 )
 from engines import ENGINE_MAP
-from dedup.hash_dedup import save_query_cache, compute_query_hash
+from dedup.hash_dedup import save_query_cache, compute_query_hash, check_query_cache
 
 
 # ============================================================
@@ -109,23 +109,38 @@ async def _process_task(task: Dict[str, Any]):
 
         query_hash = compute_query_hash(query, task_type)
 
-        await _update_task(task_id, progress=15, current_step="Fetching fresh data from web sources...")
+        # === CACHE CHECK ===
+        # Before hitting the live web, check if we have fresh cached results
+        # for this exact (query, engine) combination. If we do (within 30 days),
+        # use them — this is much faster and saves Serper/ScrapingAnt/DeepSeek quota.
+        #
+        # IMPORTANT: Credits are STILL charged on cache hits (per the handoff
+        # brief section 1 "Credits Are ALWAYS Deducted"). The cache only
+        # speeds up the response — it does not make searches free.
+        cached_leads = await check_query_cache(query_hash)
+        if cached_leads:
+            print(f"[WORKER] Cache HIT for query='{query[:50]}' engine={task_type} — using {len(cached_leads)} cached leads")
+            await _update_task(task_id, progress=50, current_step="Found cached results — loading instantly...")
+            # Trim to lead_target (cache may have more than the user paid for)
+            leads = cached_leads[:lead_target]
+        else:
+            await _update_task(task_id, progress=15, current_step="Fetching fresh data from web sources...")
 
-        engine_func = ENGINE_MAP.get(task_type)
-        if not engine_func:
-            print(f"[WORKER] Unknown task_type: {task_type}")
-            await _fail_task(task_id, user_id, credits_reserved, f"Unknown engine: {task_type}")
-            return
+            engine_func = ENGINE_MAP.get(task_type)
+            if not engine_func:
+                print(f"[WORKER] Unknown task_type: {task_type}")
+                await _fail_task(task_id, user_id, credits_reserved, f"Unknown engine: {task_type}")
+                return
 
-        # Run the engine with lead_target
-        leads = await engine_func(
-            query=query,
-            user_tier=user_tier,
-            country=country,
-            state_region=state_region,
-            lead_target=lead_target,
-            progress_callback=_make_progress_callback(task_id),
-        )
+            # Run the engine with lead_target
+            leads = await engine_func(
+                query=query,
+                user_tier=user_tier,
+                country=country,
+                state_region=state_region,
+                lead_target=lead_target,
+                progress_callback=_make_progress_callback(task_id),
+            )
 
         # Save to cache for database building
         if leads:
