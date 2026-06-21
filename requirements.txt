@@ -8,5 +8,7 @@ httpx==0.27.2
 supabase==2.7.4
 scrapling[fetchers]==0.4.8
 dnspython==2.6.1
+# Sentry — error tracking. Only initializes if SENTRY_DSN is set.
+sentry-sdk[fastapi]==2.18.0
 # selectolax is optional — code falls back to regex if not installed
 # Install manually on Render if available: pip install selectolax

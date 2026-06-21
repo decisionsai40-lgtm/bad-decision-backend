@@ -124,6 +124,15 @@ RATE_LIMIT_SEARCHES_PER_MINUTE = 5
 RATE_LIMIT_API_PER_MINUTE = 60
 
 # ============================================================
+# SENTRY — Error Tracking
+# ============================================================
+# Optional. If SENTRY_DSN is not set, Sentry is silently skipped.
+# Get a DSN from https://sentry.io → Settings → Projects → Bad Decision Backend → Client Keys (DSN)
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", "production").strip()  # production | staging | development
+SENTRY_TRACES_SAMPLE_RATE = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))  # 10% of transactions traced
+
+# ============================================================
 # SERVER
 # ============================================================
 PORT = int(os.getenv("PORT", 8000))

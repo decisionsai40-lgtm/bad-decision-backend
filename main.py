@@ -29,7 +29,43 @@ from config import (
     RATE_LIMIT_SEARCHES_PER_MINUTE, RATE_LIMIT_API_PER_MINUTE,
     CREDIT_COST_SCAN, CREDIT_COST_DEEP, CREDIT_COST_SMTP,
     LEAD_TARGET_FREE, LEAD_TARGET_PAID,
+    SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_TRACES_SAMPLE_RATE,
 )
+
+# ============================================================
+# SENTRY — Initialize as early as possible (before any requests)
+# ============================================================
+# Only initializes if SENTRY_DSN is set. Silently skipped otherwise.
+# Captures all unhandled exceptions + 10% of transactions for perf monitoring.
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        # httpx integration captures outbound HTTP errors (Serper, ScrapingAnt, DeepSeek)
+        from sentry_sdk.integrations.httpx import HttpxIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=SENTRY_ENVIRONMENT,
+            traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
+            send_default_pii=False,  # Don't send PII (emails, names) to Sentry
+            integrations=[
+                FastApiIntegration(),
+                HttpxIntegration(),
+            ],
+            # Don't log noisy 4xx HTTP exceptions as errors — they're client mistakes
+            # (rate limits, auth failures, validation errors), not server bugs.
+            ignore_errors=[
+                HTTPException,
+            ],
+        )
+        print(f"[SENTRY] Initialized — env={SENTRY_ENVIRONMENT}, traces={SENTRY_TRACES_SAMPLE_RATE}")
+    except ImportError:
+        print("[SENTRY] sentry-sdk not installed — skipping init")
+    except Exception as e:
+        print(f"[SENTRY] Init failed: {e}")
+else:
+    print("[SENTRY] SENTRY_DSN not set — skipping init")
 
 # Create the FastAPI app
 app = FastAPI(

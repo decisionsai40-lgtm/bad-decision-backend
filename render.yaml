@@ -30,5 +30,11 @@ services:
         sync: false
       - key: OSM_OVERPASS_ENDPOINT
         sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: "production"
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.1"
       - key: PYTHON_VERSION
         value: "3.11.9"
