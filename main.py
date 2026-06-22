@@ -1171,9 +1171,12 @@ async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Opti
             detail=f"You already have an active {existing.data[0]['tier']} subscription. Cancel it first to switch plans."
         )
 
-    # Call Paystack /transaction/initialize with the plan code
+    # Call Paystack /transaction/initialize with the plan code + explicit amount
+    # Paystack requires amount even when plan is specified (the plan handles recurring)
     import httpx
-    print(f"[SUBSCRIPTION] Creating for user={req.user_id}, tier={req.tier}, plan_code='{plan_code}', email={user_email}")
+    TIER_AMOUNTS_KOBO = {"starter": 1_350_000, "growth": 2_700_000, "pro": 6_100_000}
+    amount_kobo = TIER_AMOUNTS_KOBO.get(req.tier, 0)
+    print(f"[SUBSCRIPTION] Creating for user={req.user_id}, tier={req.tier}, plan_code='{plan_code}', amount={amount_kobo}, email={user_email}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -1184,7 +1187,9 @@ async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Opti
                 },
                 json={
                     "email": user_email,
+                    "amount": amount_kobo,
                     "plan": plan_code,
+                    "currency": "NGN",
                     "callback_url": "https://bad-decision-front-end.vercel.app/dashboard?sub=success",
                     "metadata": {
                         "user_id": req.user_id,
@@ -1196,7 +1201,6 @@ async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Opti
             if response.status_code != 200:
                 error_text = response.text[:500]
                 print(f"[SUBSCRIPTION] Paystack error: {error_text}")
-                # Parse the error to give the user a helpful message
                 try:
                     error_data = response.json()
                     error_msg = error_data.get("message", "Paystack error")
