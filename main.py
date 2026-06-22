@@ -105,17 +105,21 @@ app.add_middleware(
 # ============================================================
 # TIER CONFIG — which engines each tier can use
 # ============================================================
-# Free tier gets smb_maps (Local Businesses) — uses OpenStreetMap which
-# returns real structured data and tends to find more leads.
-# ads_intent is now a PAID feature (requires Starter+).
+# Phase C3: 3 engines — Companies, Businesses Running Ads, Ecommerce Brands
+# social_intent has been removed. web_absent has been replaced by ecommerce.
+# Old engine names still work as aliases for backward compatibility.
 TIER_ENGINES = {
-    "free":    ["smb_maps"],
-    "starter": ["ads_intent", "smb_maps", "web_absent", "social_intent"],
-    "growth":  ["ads_intent", "smb_maps", "web_absent", "social_intent"],
-    "pro":     ["ads_intent", "smb_maps", "web_absent", "social_intent"],
+    "free":    ["companies", "smb_maps"],
+    "starter": ["companies", "smb_maps"],
+    "growth":  ["companies", "ads_running", "ecommerce", "smb_maps", "ads_intent", "web_absent"],
+    "pro":     ["companies", "ads_running", "ecommerce", "smb_maps", "ads_intent", "web_absent"],
 }
 
-VALID_ENGINES = {"ads_intent", "smb_maps", "web_absent", "social_intent"}
+VALID_ENGINES = {
+    "companies", "ads_running", "ecommerce",
+    # Old names (backward compatibility)
+    "smb_maps", "ads_intent", "web_absent",
+}
 
 
 # ============================================================
@@ -148,7 +152,7 @@ def _rate_limit(key: str, store: dict, limit: int, window_sec: int = 60) -> bool
 # ============================================================
 class TaskCreateRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=256)
-    task_type: str = Field(..., pattern=r"^(ads_intent|smb_maps|web_absent|social_intent)$")
+    task_type: str = Field(..., pattern=r"^(companies|ads_running|ecommerce|smb_maps|ads_intent|web_absent)$")
     query: str = Field(..., min_length=1, max_length=1000)
     credits_reserved: int = Field(default=2, ge=0)
     country: str = Field(default="", max_length=10)

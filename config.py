@@ -86,6 +86,31 @@ COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
 COMPANIES_HOUSE_BASE_URL = "https://api.company-information.service.gov.uk"
 
 # ============================================================
+# OUTSCRAPER — Google Maps bulk data extraction
+# ============================================================
+OUTSCRAPER_API_KEY = os.getenv("OUTSCRAPER_API_KEY", "").strip()
+
+# ============================================================
+# YELP FUSION — Free business directory API
+# ============================================================
+YELP_FUSION_API_KEY = os.getenv("YELP_FUSION_API_KEY", "").strip()
+
+# ============================================================
+# BROWSERLESS — JS-rendered page scraping (replaces ScrapingAnt)
+# ============================================================
+BROWSERLESS_API_KEY = os.getenv("BROWSERLESS_API_KEY", "").strip()
+
+# ============================================================
+# CHECKNUMBER.AI — WhatsApp + Telegram detection
+# ============================================================
+CHECKNUMBER_API_KEY = os.getenv("CHECKNUMBER_API_KEY", "").strip()
+
+# ============================================================
+# APIFY — Facebook Ads Library + ecommerce store scraper
+# ============================================================
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip()
+
+# ============================================================
 # OPENSTREETMAP
 # ============================================================
 OSM_NOMINATIM_USER_AGENT = os.getenv("OSM_NOMINATIM_USER_AGENT", "bad-decision/1.0 (contact@baddecision.app)").strip()

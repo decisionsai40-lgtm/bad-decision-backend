@@ -26,6 +26,16 @@ services:
         sync: false
       - key: COMPANIES_HOUSE_API_KEY
         sync: false
+      - key: OUTSCRAPER_API_KEY
+        sync: false
+      - key: YELP_FUSION_API_KEY
+        sync: false
+      - key: BROWSERLESS_API_KEY
+        sync: false
+      - key: CHECKNUMBER_API_KEY
+        sync: false
+      - key: APIFY_API_TOKEN
+        sync: false
       - key: OSM_NOMINATIM_USER_AGENT
         sync: false
       - key: OSM_OVERPASS_ENDPOINT
