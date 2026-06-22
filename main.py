@@ -1173,6 +1173,7 @@ async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Opti
 
     # Call Paystack /transaction/initialize with the plan code
     import httpx
+    print(f"[SUBSCRIPTION] Creating for user={req.user_id}, tier={req.tier}, plan_code='{plan_code}', email={user_email}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -1193,8 +1194,15 @@ async def create_subscription(req: CreateSubscriptionRequest, x_api_secret: Opti
                 },
             )
             if response.status_code != 200:
-                print(f"[SUBSCRIPTION] Paystack error: {response.text[:300]}")
-                raise HTTPException(status_code=502, detail="Paystack error initializing subscription.")
+                error_text = response.text[:500]
+                print(f"[SUBSCRIPTION] Paystack error: {error_text}")
+                # Parse the error to give the user a helpful message
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("message", "Paystack error")
+                except:
+                    error_msg = "Paystack error initializing subscription."
+                raise HTTPException(status_code=502, detail=f"Paystack: {error_msg}")
             paystack_data = response.json().get("data", {})
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Paystack timeout. Please try again.")
