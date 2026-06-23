@@ -77,7 +77,7 @@ STATE_NAMES = {
     # ------ UNITED KINGDOM ------
     "GB": {
         "ENG": "England", "SCT": "Scotland", "WLS": "Wales", "NIR": "Northern Ireland",
-        "LDN": "London", "MAN": "Manchester", "BIR": "Birmingham", "LDS": "Leeds",
+        "LND": "London", "LDN": "London", "MAN": "Manchester", "BIR": "Birmingham", "LDS": "Leeds",
         "GLA": "Glasgow", "SHE": "Sheffield", "BRS": "Bristol", "LPL": "Liverpool",
         "EDB": "Edinburgh", "LCE": "Leicester", "CRD": "Cardiff", "BFS": "Belfast",
     },

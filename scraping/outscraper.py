@@ -89,24 +89,35 @@ async def scrape_google_maps(
             data = response.json()
 
             # Outscraper returns results in different formats depending on the endpoint.
-            # The /google-maps-search endpoint returns: { "data": [...] } or just [...]
-            # Each item has fields like: name, site, phone, address, rating, reviews, category
-            if isinstance(data, dict):
-                results = data.get("data", data.get("results", []))
-            elif isinstance(data, list):
-                # Sometimes the response is a list with a single object containing the actual results
-                if len(data) == 1 and isinstance(data[0], dict) and "data" in data[0]:
-                    results = data[0]["data"]
+            # Handle all known formats:
+            #   1. [{"query": "...", "data": [{...}, {...}]}]  (most common)
+            #   2. [{...}, {...}]  (flat list of businesses)
+            #   3. {"data": [{...}, {...}]}
+            #   4. {"results": [{...}, {...}]}
+            results = []
+
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "data" in item and isinstance(item["data"], list):
+                        results.extend(item["data"])
+                    elif isinstance(item, dict):
+                        results.append(item)
+            elif isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], list):
+                    results = data["data"]
+                elif "results" in data and isinstance(data["results"], list):
+                    results = data["results"]
                 else:
-                    results = data
-            else:
-                results = []
+                    results = [data]
+
+            # Filter to only dict items — prevents 'list' object has no attribute 'get'
+            results = [r for r in results if isinstance(r, dict)]
 
             businesses = []
             for item in results[:limit]:
                 business = {
-                    "company_name": item.get("site", item.get("name", "")),
-                    "website_url": item.get("site", item.get("website", "ABSENT")),
+                    "company_name": item.get("site") or item.get("name") or "",
+                    "website_url": item.get("site") or item.get("website") or "ABSENT",
                     "phone": item.get("phone", "ABSENT"),
                     "address": item.get("address", "ABSENT"),
                     "rating": float(item.get("rating", 0) or 0),
