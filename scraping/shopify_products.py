@@ -31,10 +31,17 @@ async def fetch_shopify_products(website_url: str) -> Optional[Dict[str, Any]]:
     if not website_url or website_url == "ABSENT":
         return None
 
-    # Normalize URL
+    # Normalize URL — strip query params and fragments
+    # Serper returns URLs like https://example.com/?srsltid=AfmBOor... which
+    # break the products.json endpoint. We only want the root domain.
     if not website_url.startswith("http"):
         website_url = "https://" + website_url
-    base_url = website_url.rstrip("/")
+    # Strip query string and fragment
+    from urllib.parse import urlparse
+    parsed = urlparse(website_url)
+    base_url = f"{parsed.scheme}://{parsed.hostname}"
+    # Strip trailing slash for consistency
+    base_url = base_url.rstrip("/")
 
     try:
         async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT, follow_redirects=True) as client:

@@ -68,9 +68,12 @@ async def detect_ecommerce_platform(website_url: str) -> Optional[str]:
     if not website_url or website_url == "ABSENT":
         return None
 
-    # Normalize URL
+    # Normalize URL — strip query params (Serper adds ?srsltid=... which breaks detection)
     if not website_url.startswith("http"):
         website_url = "https://" + website_url
+    from urllib.parse import urlparse
+    parsed = urlparse(website_url)
+    website_url = f"{parsed.scheme}://{parsed.hostname}"
 
     try:
         async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT, follow_redirects=True) as client:
@@ -104,7 +107,10 @@ async def detect_ecommerce_platform(website_url: str) -> Optional[str]:
 async def _check_shopify_products_endpoint(website_url: str) -> bool:
     """Check if /products.json returns valid JSON (definitive Shopify check)."""
     try:
-        base_url = website_url.rstrip("/")
+        # Strip query params — Serper adds ?srsltid=... which breaks the endpoint
+        from urllib.parse import urlparse
+        parsed = urlparse(website_url)
+        base_url = f"{parsed.scheme}://{parsed.hostname}"
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.get(
                 f"{base_url}/products.json",

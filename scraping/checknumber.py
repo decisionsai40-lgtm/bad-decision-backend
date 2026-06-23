@@ -22,6 +22,11 @@ from typing import Dict
 CHECKNUMBER_API_KEY = os.getenv("CHECKNUMBER_API_KEY", "").strip()
 CHECKNUMBER_API_BASE = "https://api.checknumber.ai/v1"
 
+# Track if the API key has been rejected — once we see "TOKEN IS INVALID",
+# stop making API calls for the rest of the process (avoids wasting time
+# on every lead when the key is bad).
+_KEY_INVALID = False
+
 
 async def _check_single_platform(client: httpx.AsyncClient, phone: str, service: str) -> bool:
     """Check a single platform (whatsapp or telegram) for a phone number."""
@@ -46,6 +51,14 @@ async def _check_single_platform(client: httpx.AsyncClient, phone: str, service:
         data = response.json()
         # Log the raw response so we can see the actual format
         print(f"[CHECKNUMBER] {phone}/{service} → RAW: {str(data)[:300]}")
+
+        # Check for invalid API key — if we see this, stop all future checks
+        status = (data.get("status") or "").upper() if isinstance(data, dict) else ""
+        if "INVALID" in status or "X-APP-KEY" in status:
+            global _KEY_INVALID
+            _KEY_INVALID = True
+            print(f"[CHECKNUMBER] API KEY IS INVALID — disabling all future checks. Response: {data}")
+            return False
 
         # The API may return the result under various field names.
         # Check all known variants:
@@ -98,6 +111,12 @@ async def check_messaging_platforms(phone_number: str) -> Dict[str, bool]:
     Returns:
         {"whatsapp": bool, "telegram": bool}
     """
+    global _KEY_INVALID
+
+    # If we already know the key is invalid, skip all checks (saves time)
+    if _KEY_INVALID:
+        return {"whatsapp": False, "telegram": False}
+
     if not CHECKNUMBER_API_KEY:
         if not hasattr(check_messaging_platforms, '_warned_no_key'):
             print("[CHECKNUMBER] WARNING: CHECKNUMBER_API_KEY is not set. WhatsApp/Telegram detection disabled.")
