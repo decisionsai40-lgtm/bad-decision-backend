@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 from typing import List, Dict, Any, Callable, Optional
 
 from scraping.serper_search import serper_search, build_web_absent_queries
-from scraping.scrapingant import scrape_with_js
+from scraping.browserless import scrape_with_js
 from scraping.stealth_fetcher import (
     extract_links_from_html,
     build_yelp_search_url,
@@ -42,7 +42,7 @@ from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import SCRAPINGANT_API_KEY
+from config import BROWSERLESS_API_KEY
 
 
 # Aggregator domains we expect businesses to be ON (not their own website)
@@ -85,7 +85,7 @@ async def run_web_absent(
     # Optionally fetch Yelp + Houzz search pages via ScrapingAnt (JS rendering)
     js_tasks: List[Any] = []
     js_source_names: List[str] = []
-    if SCRAPINGANT_API_KEY:
+    if BROWSERLESS_API_KEY:
         yelp_url = build_yelp_search_url(query, state_region or country)
         houzz_url = build_houzz_search_url(query)
         js_tasks = [scrape_with_js(yelp_url), scrape_with_js(houzz_url)]
@@ -180,7 +180,7 @@ async def run_web_absent(
     # --------------------------------------------------------
     # PHASE 1b: OPTIONAL — ScrapingAnt deep-fetch on aggregator profile URLs
     # --------------------------------------------------------
-    if SCRAPINGANT_API_KEY and aggregator_profile_urls and len(leads) < lead_target:
+    if BROWSERLESS_API_KEY and aggregator_profile_urls and len(leads) < lead_target:
         # Cap at 3 profile fetches to conserve ScrapingAnt credits
         deep_fetch_urls = aggregator_profile_urls[:3]
         if progress_callback:

@@ -36,7 +36,7 @@ from scraping.serper_search import (
     serper_maps_search,
     build_smb_maps_queries,
 )
-from scraping.scrapingant import scrape_with_js
+from scraping.browserless import scrape_with_js
 from scraping.email_scraper import enrich_lead_with_email
 from scraping.osm_search import search_local_businesses
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
@@ -45,7 +45,7 @@ from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import SCRAPINGANT_API_KEY
+from config import BROWSERLESS_API_KEY
 
 
 # ============================================================
@@ -150,7 +150,7 @@ async def run_smb_maps(
     # PHASE 1b: OPTIONAL — ScrapingAnt for Yelp pages (JS rendering)
     # --------------------------------------------------------
     scraped_texts: List[Dict[str, str]] = []
-    if yelp_urls and SCRAPINGANT_API_KEY:
+    if yelp_urls and BROWSERLESS_API_KEY:
         if progress_callback:
             await progress_callback(25, f"Reading business directory pages...")
 

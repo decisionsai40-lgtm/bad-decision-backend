@@ -100,10 +100,17 @@ async def _process_task(task: Dict[str, Any]):
         tier_caps = {
             "free": LEAD_TARGET_FREE,       # 25
             "starter": LEAD_TARGET_STARTER,  # 50
-            "growth": LEAD_TARGET_GROWTH,    # 75
-            "pro": LEAD_TARGET_PAID,         # 100
+            "growth": LEAD_TARGET_GROWTH,    # 200
+            "pro": LEAD_TARGET_PAID,         # 400
         }
         tier_cap = tier_caps.get(user_tier, LEAD_TARGET_FREE)
+
+        # Ecommerce engine gets much higher caps
+        if task_type in ("ecommerce", "web_absent"):
+            if user_tier == "growth":
+                tier_cap = 500
+            elif user_tier == "pro":
+                tier_cap = 2000
         lead_target = min(max_leads_by_credits, tier_cap)
 
         # Don't allow less than 5 (even if credits are low)
@@ -266,6 +273,34 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
             "outreach_email": lead.get("outreach_email"),
             "outreach_social": lead.get("outreach_social"),
             "outreach_call": lead.get("outreach_call"),
+            # Ecommerce fields
+            "ecommerce_platform": lead.get("ecommerce_platform"),
+            "product_count": lead.get("product_count"),
+            "product_categories": lead.get("product_categories"),
+            "average_price": lead.get("average_price"),
+            "price_range": lead.get("price_range"),
+            "store_currency": lead.get("store_currency"),
+            "estimated_revenue": lead.get("estimated_revenue"),
+            "tech_stack": lead.get("tech_stack"),
+            "uses_email_marketing": lead.get("uses_email_marketing"),
+            "uses_ad_tracking": lead.get("uses_ad_tracking"),
+            "uses_subscriptions": lead.get("uses_subscriptions"),
+            "store_age_days": lead.get("store_age_days"),
+            "social_media_links": lead.get("social_media_links"),
+            # Ads engine fields
+            "ad_platforms": lead.get("ad_platforms"),
+            "ad_start_date": lead.get("ad_start_date"),
+            "ad_creative_url": lead.get("ad_creative_url"),
+            "estimated_monthly_ad_spend": lead.get("estimated_monthly_ad_spend"),
+            # Companies enrichment fields
+            "naics_code": lead.get("naics_code"),
+            "naics_description": lead.get("naics_description"),
+            "business_start_date": lead.get("business_start_date"),
+            "company_officers": lead.get("company_officers"),
+            # Messaging platform detection
+            "is_whatsapp": lead.get("is_whatsapp"),
+            "is_telegram": lead.get("is_telegram"),
+            "messaging_checked": lead.get("messaging_checked"),
         }
 
         # Remove None values

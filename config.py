@@ -135,10 +135,12 @@ CREDIT_FREE_RENEWAL_DAYS = 30     # Free credits expire/renew every 30 days
 CREDIT_PAID_EXPIRY_DAYS = 60      # Paid credits expire 60 days after purchase
 
 # Lead targets — credit-aware (engine will check user balance)
-LEAD_TARGET_FREE = 25       # Free tier cap (was 50 — reduced for free tier)
+LEAD_TARGET_FREE = 25       # Free tier cap
 LEAD_TARGET_STARTER = 50    # Starter tier cap
-LEAD_TARGET_GROWTH = 75     # Growth tier cap
-LEAD_TARGET_PAID = 100      # Pro tier cap
+LEAD_TARGET_GROWTH = 200    # Growth tier cap
+LEAD_TARGET_PAID = 400      # Pro tier cap
+LEAD_TARGET_ECOMMERCE_GROWTH = 500   # Ecommerce engine Growth cap
+LEAD_TARGET_ECOMMERCE_PRO = 2000     # Ecommerce engine Pro cap
 MIN_LEADS_WARNING = 10      # Show warning if user can't afford this many
 
 # ============================================================

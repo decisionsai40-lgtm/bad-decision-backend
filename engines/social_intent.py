@@ -29,12 +29,12 @@ import asyncio
 from typing import List, Dict, Any, Callable, Optional
 
 from scraping.serper_search import serper_search, build_social_intent_queries
-from scraping.scrapingant import scrape_with_js
+from scraping.browserless import scrape_with_js
 from scraping.stealth_fetcher import build_reddit_search_url
 from scraping.email_scraper import enrich_lead_with_email
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from dedup.hash_dedup import compute_domain_hash
-from config import SCRAPINGANT_API_KEY
+from config import BROWSERLESS_API_KEY
 
 
 # Intent inference keywords (case-insensitive substring match)
@@ -82,7 +82,7 @@ async def run_social_intent(
 
     # Optionally fetch Reddit search page via ScrapingAnt (JS rendering)
     reddit_task: Optional[Any] = None
-    if SCRAPINGANT_API_KEY:
+    if BROWSERLESS_API_KEY:
         reddit_task = scrape_with_js(build_reddit_search_url(query))
     else:
         print("[SOCIAL_INTENT] ScrapingAnt not configured — skipping Reddit JS fetch")
@@ -139,7 +139,7 @@ async def run_social_intent(
     # --------------------------------------------------------
     # PHASE 1b: OPTIONAL — ScrapingAnt deep-fetch on Reddit post URLs
     # --------------------------------------------------------
-    if SCRAPINGANT_API_KEY and reddit_profile_urls and len(leads) < lead_target:
+    if BROWSERLESS_API_KEY and reddit_profile_urls and len(leads) < lead_target:
         deep_fetch_urls = reddit_profile_urls[:3]
         if progress_callback:
             await progress_callback(25, f"Reading social media posts...")
