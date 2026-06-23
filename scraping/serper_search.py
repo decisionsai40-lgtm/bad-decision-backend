@@ -7,6 +7,43 @@ import httpx
 from typing import List, Dict, Any
 
 from config import SERPER_API_KEY, SERPER_BASE_URL, SOURCE_TIMEOUT
+from scraping.location_mapper import get_country_name
+
+
+# Map ISO country codes → Serper gl (geolocation) codes.
+# Serper uses ISO 3166-1 alpha-2 codes for gl — same as our country codes.
+# But we also need to set the right language code (hl).
+COUNTRY_LOCALE = {
+    "US": ("us", "en"), "CA": ("ca", "en"), "GB": ("uk", "en"),
+    "AU": ("au", "en"), "NG": ("ng", "en"), "ZA": ("za", "en"),
+    "KE": ("ke", "en"), "GH": ("gh", "en"), "IN": ("in", "en"),
+    "PK": ("pk", "en"), "BD": ("bd", "en"), "DE": ("de", "de"),
+    "FR": ("fr", "fr"), "ES": ("es", "es"), "IT": ("it", "it"),
+    "NL": ("nl", "nl"), "AE": ("ae", "en"), "SA": ("sa", "ar"),
+    "JP": ("jp", "ja"), "KR": ("kr", "ko"), "CN": ("cn", "zh"),
+    "BR": ("br", "pt"), "MX": ("mx", "es"), "RU": ("ru", "ru"),
+    "TR": ("tr", "tr"), "EG": ("eg", "ar"), "SG": ("sg", "en"),
+    "MY": ("my", "en"), "PH": ("ph", "en"), "TH": ("th", "th"),
+    "ID": ("id", "en"), "VN": ("vn", "vi"), "NZ": ("nz", "en"),
+    "IE": ("ie", "en"), "SE": ("se", "sv"), "NO": ("no", "no"),
+    "DK": ("dk", "da"), "FI": ("fi", "fi"), "PL": ("pl", "pl"),
+    "PT": ("pt", "pt"), "GR": ("gr", "el"), "CZ": ("cz", "cs"),
+    "AR": ("ar", "es"), "CL": ("cl", "es"), "CO": ("co", "es"),
+    "PE": ("pe", "es"), "CH": ("ch", "de"), "AT": ("at", "de"),
+    "BE": ("be", "nl"), "UA": ("ua", "uk"), "RO": ("ro", "ro"),
+    "HU": ("hu", "hu"), "IL": ("il", "en"), "QA": ("qa", "ar"),
+    "KW": ("kw", "ar"), "BH": ("bh", "ar"), "OM": ("om", "ar"),
+    "JO": ("jo", "ar"), "LB": ("lb", "ar"), "MA": ("ma", "ar"),
+    "TN": ("tn", "ar"), "DZ": ("dz", "ar"),
+}
+
+
+def _get_locale(country_code: str) -> tuple:
+    """Return (gl, hl) for Serper based on country code."""
+    if not country_code:
+        return ("us", "en")
+    code = country_code.upper().strip()
+    return COUNTRY_LOCALE.get(code, (code.lower(), "en"))
 
 
 async def serper_search(
@@ -14,19 +51,33 @@ async def serper_search(
     num_results: int = 20,
     search_type: str = "search",
     location: str = "",
+    country_code: str = "",
 ) -> List[Dict[str, Any]]:
-    """Search Google via Serper.dev. Returns clean JSON results."""
+    """Search Google via Serper.dev. Returns clean JSON results.
+
+    Args:
+        query: Search query
+        num_results: Max results to return
+        search_type: 'search' (default) or 'maps'
+        location: Full location string (e.g. "Lagos, Nigeria")
+        country_code: ISO country code (e.g. "NG") — used to set gl/hl
+    """
     if not SERPER_API_KEY:
         print("[SERPER] No API key configured — skipping")
         return []
 
     endpoint = f"{SERPER_BASE_URL}/{search_type}"
 
+    # Determine geolocation (gl) and language (hl) from country code.
+    # This is CRITICAL: without gl="ng", Serper returns US results
+    # even when location="Lagos, Nigeria" is set.
+    gl, hl = _get_locale(country_code)
+
     payload: Dict[str, Any] = {
         "q": query,
         "num": min(num_results, 100),
-        "gl": "us",
-        "hl": "en",
+        "gl": gl,
+        "hl": hl,
     }
 
     if location:
@@ -61,19 +112,24 @@ async def serper_search(
                 places = data.get("places", [])
                 results = []
                 for i, p in enumerate(places):
+                    # Extract website URL — Serper maps returns it under "website"
+                    website = p.get("website", "") or p.get("site", "") or ""
+                    # Clean up the website URL
+                    if website and not website.startswith("http"):
+                        website = "https://" + website
                     results.append({
                         "title": p.get("title", ""),
-                        "link": p.get("website", ""),
+                        "link": website,
                         "snippet": f"{p.get('address', '')} {p.get('phoneNumber', '')}".strip(),
                         "address": p.get("address", ""),
                         "phone": p.get("phoneNumber", ""),
-                        "website": p.get("website", ""),
+                        "website": website,
                         "rating": p.get("rating", 0),
                         "ratingCount": p.get("ratingCount", 0),
-                        "category": p.get("category", ""),
+                        "category": p.get("category", "") or p.get("types", ""),
                         "position": i,
                     })
-                print(f"[SERPER] Maps: {len(results)} places for '{query[:50]}'")
+                print(f"[SERPER] Maps: {len(results)} places for '{query[:50]}' (gl={gl}, loc={location})")
                 return results
 
             # Standard search
@@ -87,7 +143,7 @@ async def serper_search(
                     "position": i,
                 })
 
-            print(f"[SERPER] {len(results)} results for '{query[:50]}'")
+            print(f"[SERPER] {len(results)} results for '{query[:50]}' (gl={gl})")
             return results
 
     except httpx.TimeoutException:
@@ -124,12 +180,12 @@ async def serper_multi_search(queries: list, num_results: int = 10) -> list:
     return all_results
 
 
-async def serper_maps_search(query: str, location: str = "") -> list:
+async def serper_maps_search(query: str, location: str = "", country_code: str = "") -> list:
     """
     Search Google Maps via Serper.dev.
     Returns businesses with rating, reviews, phone, address, website.
     """
-    return await serper_search(query, num_results=20, search_type="maps", location=location)
+    return await serper_search(query, num_results=20, search_type="maps", location=location, country_code=country_code)
 
 
 # ============================================================

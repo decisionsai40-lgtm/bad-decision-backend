@@ -42,6 +42,8 @@ from scraping.osm_search import search_local_businesses
 from scraping.outscraper import scrape_google_maps, build_geo_split_queries
 from scraping.yelp_fusion import search_yelp
 from scraping.checknumber import check_messaging_platforms
+from scraping.location_mapper import build_location_string, get_country_name, get_state_name
+from scraping.industry_enrichment import get_industry_info, build_industry_queries
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
@@ -66,23 +68,41 @@ async def run_smb_maps(
     leads: List[Dict[str, Any]] = []
     seen_hashes: set = set()
 
-    # Build a location string for Serper (used by query builders + maps search)
-    location_parts = [p for p in [state_region, country] if p]
-    location = ", ".join(location_parts) if location_parts else ""
+    # Build a location string for Serper/Outscraper/Yelp.
+    # CRITICAL: Serper and Outscraper need FULL NAMES, not ISO codes.
+    # "LA, NG" returns US results. "Lagos, Nigeria" returns Nigerian results.
+    location = build_location_string(country, state_region)
 
     print(f"[SMB_MAPS] Start — query='{query}', tier={user_tier}, target={lead_target}, loc='{location}'")
 
     # --------------------------------------------------------
     # PHASE 1: Serper maps + 10x Serper web searches (CONCURRENT)
+    # Industry-specific queries are added on top of the generic ones
+    # so the engine finds leads from RELEVANT sources (LinkedIn for coaches,
+    # Zillow for real estate, Avvo for lawyers, etc.)
     # --------------------------------------------------------
     if progress_callback:
         await progress_callback(15, f"Searching for local businesses in {location or 'your area'}...")
 
-    web_queries = build_smb_maps_queries(query, location)
+    # Detect industry and build queries
+    industry_info = get_industry_info(query)
+    if industry_info["industry"] != "generic":
+        print(f"[SMB_MAPS] Detected industry: {industry_info['industry']} (matched: {industry_info['matched_keywords']})")
+        if progress_callback:
+            await progress_callback(18, f"Searching {industry_info['industry']} sources in {location or 'your area'}...")
 
-    # Run maps search + 10 web searches concurrently (11 total fetches)
-    maps_task = serper_maps_search(query, location=location)
-    web_tasks = [serper_search(q, num_results=10) for q in web_queries]
+    # Build generic queries + industry-specific queries
+    web_queries = build_smb_maps_queries(query, location)
+    industry_queries = build_industry_queries(query, location, industry_info["industry"])
+    # Combine, deduplicate, and cap at 15 total queries (10 generic + 5 industry)
+    all_queries = list(dict.fromkeys(web_queries + industry_queries))[:15]
+
+    print(f"[SMB_MAPS] Running {len(all_queries)} search queries ({len(web_queries)} generic + {len(industry_queries)} industry-specific)")
+
+    # Run maps search + all web searches concurrently
+    # Pass country_code so Serper sets gl="ng" for Nigeria, gl="us" for US, etc.
+    maps_task = serper_maps_search(query, location=location, country_code=country)
+    web_tasks = [serper_search(q, num_results=10, country_code=country) for q in all_queries]
 
     all_fetches = await asyncio.gather(
         maps_task, *web_tasks, return_exceptions=True
@@ -99,7 +119,16 @@ async def run_smb_maps(
             company_name = (place.get("title") or "").strip()
             if not company_name:
                 continue
-            website_url = place.get("website") or place.get("link") or "ABSENT"
+            # Website URL: try multiple fields, then normalize
+            website_url = place.get("website") or place.get("link") or ""
+            if website_url and website_url != "ABSENT":
+                # Clean up the URL — ensure it has a protocol
+                if not website_url.startswith("http"):
+                    website_url = "https://" + website_url
+                # Strip trailing slash for consistency
+                website_url = website_url.rstrip("/")
+            else:
+                website_url = "ABSENT"
             rating = _safe_float(place.get("rating"))
             review_count = _safe_int(place.get("ratingCount"))
             category = place.get("category") or "ABSENT"
