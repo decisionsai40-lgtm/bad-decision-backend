@@ -91,14 +91,24 @@ async def check_smtp(email_address: str) -> Tuple[bool, bool]:
         return False, False
 
     except smtplib.SMTPServerDisconnected:
-        print(f"[GATE2-SMTP] {email_address} — Server disconnected")
-        return False, False
+        print(f"[GATE2-SMTP] {email_address} — Server disconnected (lenient accept)")
+        return True, False
 
     except smtplib.SMTPConnectError:
-        print(f"[GATE2-SMTP] {email_address} — Connection failed")
-        return False, False
+        print(f"[GATE2-SMTP] {email_address} — Connection failed (lenient accept)")
+        return True, False
+
+    except (TimeoutError, OSError) as e:
+        # Network unreachable, connection refused, timeout — Render blocks port 25.
+        # Don't drop leads because we can't reach the SMTP server.
+        # The MX record exists (we already verified that), so the domain CAN receive email.
+        print(f"[GATE2-SMTP] {email_address} — Network error ({e}), lenient accept")
+        return True, False
 
     except Exception as e:
-        print(f"[GATE2-SMTP] {email_address} — Error: {e}")
-        # On network errors, assume valid (don't drop on transient failures)
+        err_str = str(e).lower()
+        if 'network is unreachable' in err_str or 'connection refused' in err_str or 'timed out' in err_str:
+            print(f"[GATE2-SMTP] {email_address} — Network error (lenient accept): {e}")
+            return True, False
+        print(f"[GATE2-SMTP] {email_address} — Error: {e} (lenient accept)")
         return True, False

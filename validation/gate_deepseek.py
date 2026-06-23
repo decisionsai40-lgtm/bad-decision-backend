@@ -101,7 +101,30 @@ async def check_deepseek(email_address: str, company_name: str = "") -> Tuple[bo
         })
 
         content = response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        parsed = json.loads(content)
+
+        # DeepSeek sometimes returns malformed JSON (unterminated string, trailing comma, etc.)
+        # Try strict parse first, then fall back to lenient extraction.
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as parse_err:
+            print(f"[GATE3-DEEPSEEK] {email_address} — JSON parse failed ({parse_err}), attempting regex extraction")
+            import re
+            def _extract_bool(key: str) -> bool:
+                m = re.search(rf'"{key}"\s*:\s*(true|false)', content, re.IGNORECASE)
+                return m.group(1).lower() == "true" if m else False
+            def _extract_float(key: str, default: float = 0.5) -> float:
+                m = re.search(rf'"{key}"\s*:\s*([0-9]*\.?[0-9]+)', content)
+                try:
+                    return float(m.group(1)) if m else default
+                except (ValueError, IndexError):
+                    return default
+            parsed = {
+                "is_personal": _extract_bool("is_personal"),
+                "is_role": _extract_bool("is_role"),
+                "confidence": _extract_float("confidence", 0.5),
+                "reason": "Extracted from partial JSON response",
+            }
+            print(f"[GATE3-DEEPSEEK] {email_address} — Recovered fields: {parsed}")
 
         is_personal = parsed.get("is_personal", True)
         is_role = parsed.get("is_role", False)

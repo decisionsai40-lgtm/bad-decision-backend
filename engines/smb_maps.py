@@ -193,7 +193,7 @@ async def run_smb_maps(
         # Outscraper: geographic split queries for maximum coverage
         if OUTSCRAPER_API_KEY:
             geo_queries = build_geo_split_queries(query, location)
-            for gq in geo_queries[:3]:  # Cap at 3 sub-regions to control cost
+            for gq in geo_queries:  # Use ALL 6 sub-regions for max coverage
                 extra_tasks.append(scrape_google_maps(query, gq, limit=min(100, lead_target)))
                 extra_task_names.append("outscraper")
 

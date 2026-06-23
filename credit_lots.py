@@ -45,7 +45,7 @@ async def deduct_credits_fifo(user_id: str, amount: int, description: str = "") 
         .eq("user_id", user_id)
         .gt("remaining", 0)
         .gt("expires_at", now_iso)
-        .order("expires_at", asc=True)
+        .order("expires_at", desc=False)
         .execute()
     )
 
