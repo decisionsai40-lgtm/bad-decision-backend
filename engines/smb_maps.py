@@ -44,6 +44,8 @@ from scraping.yelp_fusion import search_yelp
 from scraping.checknumber import check_messaging_platforms
 from scraping.location_mapper import build_location_string, get_country_name, get_state_name
 from scraping.industry_enrichment import get_industry_info, build_industry_queries
+from scraping.phone_normalizer import normalize_phone
+from scraping.url_cleaner import extract_root_website, is_aggregator_url
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
@@ -120,13 +122,12 @@ async def run_smb_maps(
             if not company_name:
                 continue
             # Website URL: try multiple fields, then normalize
-            website_url = place.get("website") or place.get("link") or ""
-            if website_url and website_url != "ABSENT":
-                # Clean up the URL — ensure it has a protocol
-                if not website_url.startswith("http"):
-                    website_url = "https://" + website_url
-                # Strip trailing slash for consistency
-                website_url = website_url.rstrip("/")
+            # extract_root_website strips long source URLs (yelp.com/biz/...) and
+            # returns just the root domain (https://example.com) or ABSENT if it's
+            # a social media / directory URL.
+            raw_url = place.get("website") or place.get("link") or ""
+            if raw_url and raw_url != "ABSENT":
+                website_url = extract_root_website(raw_url)
             else:
                 website_url = "ABSENT"
             rating = _safe_float(place.get("rating"))
@@ -251,7 +252,7 @@ async def run_smb_maps(
                     if not company_name or company_name == "ABSENT":
                         continue
 
-                    website_url = biz.get("website_url", "ABSENT")
+                    website_url = extract_root_website(biz.get("website_url", "ABSENT"))
                     domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
                     if domain_hash in seen_hashes:
                         continue
@@ -419,7 +420,7 @@ async def run_smb_maps(
     all_candidates = list(maps_leads)
     for biz in structured_businesses:
         company_name = (biz.get("company_name") or "").strip()
-        website_url = biz.get("website_url", "ABSENT")
+        website_url = extract_root_website(biz.get("website_url", "ABSENT"))
         if not company_name or company_name == "ABSENT":
             continue
         domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
@@ -544,6 +545,13 @@ async def run_smb_maps(
             if user_tier in ("growth", "pro"):
                 p = lead.get("phone", "ABSENT")
                 if p and p != "ABSENT":
+                    # Normalize phone to E.164 format with country code.
+                    # CheckNumber.ai (and WhatsApp/Telegram) require the full
+                    # international format (+234..., +1...) to work correctly.
+                    normalized = normalize_phone(p, country)
+                    if normalized != p:
+                        lead["phone"] = normalized
+                        p = normalized
                     try:
                         messaging = await check_messaging_platforms(p)
                         lead["is_whatsapp"] = messaging["whatsapp"]

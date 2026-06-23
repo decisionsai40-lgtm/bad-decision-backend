@@ -32,6 +32,10 @@ from scraping.ecommerce_detector import detect_ecommerce_platform
 from scraping.shopify_products import fetch_shopify_products
 from scraping.tech_stack_detector import detect_tech_stack
 from scraping.checknumber import check_messaging_platforms
+from scraping.location_mapper import build_location_string
+from scraping.phone_normalizer import normalize_phone
+from scraping.url_cleaner import extract_root_website
+from scraping.domain_age import get_domain_age_days
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from dedup.hash_dedup import compute_domain_hash
 from validation.gate_footprint import check_footprint
@@ -53,8 +57,8 @@ async def run_ecommerce(
     leads: List[Dict[str, Any]] = []
     seen_hashes: set = set()
 
-    location_parts = [p for p in [state_region, country] if p]
-    location = ", ".join(location_parts) if location_parts else ""
+    # Build location string from ISO codes (NG + LA → "Lagos, Nigeria")
+    location = build_location_string(country, state_region)
 
     print(f"[ECOMMERCE] Start: query='{query}', tier={user_tier}, target={lead_target}, loc='{location}'")
 
@@ -65,7 +69,7 @@ async def run_ecommerce(
         await progress_callback(15, "Searching for online stores...")
 
     web_queries = _build_ecommerce_queries(query, location)
-    web_tasks = [serper_search(q, num_results=10) for q in web_queries]
+    web_tasks = [serper_search(q, num_results=10, country_code=country) for q in web_queries]
     all_fetches = await asyncio.gather(*web_tasks, return_exceptions=True)
 
     all_urls: List[str] = []
@@ -110,17 +114,38 @@ async def run_ecommerce(
 
     # --------------------------------------------------------
     # PHASE 3: Messaging platform check (WhatsApp + Telegram)
+    # Normalize phones to E.164 first, then check concurrently.
     # --------------------------------------------------------
     if progress_callback:
         await progress_callback(90, "Checking messaging platforms...")
 
-    for lead in leads:
-        phone = lead.get("phone", "ABSENT")
-        if phone and phone != "ABSENT":
-            messaging = await check_messaging_platforms(phone)
-            lead["is_whatsapp"] = messaging["whatsapp"]
-            lead["is_telegram"] = messaging["telegram"]
-            lead["messaging_checked"] = True
+    if user_tier in ("growth", "pro"):
+        # Normalize all phones first
+        for lead in leads:
+            p = lead.get("phone", "ABSENT")
+            if p and p != "ABSENT":
+                lead["phone"] = normalize_phone(p, country)
+
+        # Check messaging platforms concurrently (5 at a time)
+        MAX_CONCURRENT = 5
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def check_one(lead):
+            async with sem:
+                p = lead.get("phone", "ABSENT")
+                if p and p != "ABSENT":
+                    try:
+                        messaging = await check_messaging_platforms(p)
+                        lead["is_whatsapp"] = messaging["whatsapp"]
+                        lead["is_telegram"] = messaging["telegram"]
+                        lead["messaging_checked"] = True
+                    except Exception as e:
+                        print(f"[ECOMMERCE] CheckNumber error for {p}: {e}")
+                        lead["is_whatsapp"] = False
+                        lead["is_telegram"] = False
+                        lead["messaging_checked"] = False
+
+        await asyncio.gather(*[check_one(l) for l in leads], return_exceptions=True)
 
     if progress_callback:
         await progress_callback(95, f"Found {len(leads)} verified ecommerce brands")
@@ -203,6 +228,11 @@ async def _process_ecommerce_url(
     lead["uses_subscriptions"] = tech_data["uses_subscriptions"]
     if tech_data["social_media"]:
         lead["social_media_links"] = tech_data["social_media"]
+
+    # Domain age lookup (free RDAP query)
+    age_days = await get_domain_age_days(url)
+    if age_days and age_days > 0:
+        lead["store_age_days"] = age_days
 
     # Estimate revenue based on product count + platform
     lead["estimated_revenue"] = _estimate_revenue(lead)
