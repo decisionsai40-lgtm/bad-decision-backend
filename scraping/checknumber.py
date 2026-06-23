@@ -97,7 +97,10 @@ async def _check_single_platform(client: httpx.AsyncClient, phone: str, service:
         return False
 
     except Exception as e:
-        print(f"[CHECKNUMBER] Error checking {phone}/{service}: {e}")
+        # Log the full exception type and message — the empty error in logs
+        # was because str(e) was empty for some exception types
+        import traceback
+        print(f"[CHECKNUMBER] Error checking {phone}/{service}: {type(e).__name__}: {str(e) or repr(e)}")
         return False
 
 

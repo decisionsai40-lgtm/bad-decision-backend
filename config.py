@@ -160,7 +160,7 @@ MAX_CONCURRENT_LEADS = 10     # Increased — email scraper is lightweight
 # ============================================================
 # TIMEOUTS
 # ============================================================
-SOURCE_TIMEOUT = 15
+SOURCE_TIMEOUT = 8  # Reduced from 15 — was causing slow searches with many website timeouts
 SCRAPINGANT_TIMEOUT = 30      # ScrapingAnt needs more time (JS rendering)
 TASK_TIMEOUT = 180            # 3 minutes for larger searches
 SMTP_TIMEOUT = 10
