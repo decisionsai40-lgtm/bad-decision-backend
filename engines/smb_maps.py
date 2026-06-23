@@ -408,149 +408,56 @@ async def run_smb_maps(
             print(f"[SMB_MAPS] DeepSeek structuring error: {e}")
 
     # --------------------------------------------------------
-    # PHASE 4: Validate & enrich maps_leads (already structured)
+    # PHASE 4 + 5 + 6: Validate, enrich, and detect messaging platforms
+    # CONCURRENTLY (5 leads at a time) — was sequential, causing 15-30 min
+    # search times and Render worker timeouts.
     # --------------------------------------------------------
     if progress_callback:
-        await progress_callback(50, f"Verifying businesses...")
+        await progress_callback(50, f"Verifying {len(maps_leads) + len(structured_businesses)} businesses...")
 
-    # Process maps leads first (they have the richest structured data)
-    for biz in maps_leads:
-        if len(leads) >= lead_target:
-            break
-
-        company_name = biz["company_name"]
+    # Combine all candidate businesses (maps leads first, then structured)
+    all_candidates = list(maps_leads)
+    for biz in structured_businesses:
+        company_name = (biz.get("company_name") or "").strip()
         website_url = biz.get("website_url", "ABSENT")
-
-        # Gate 1: DNS Check (ALL tiers — only if website exists)
-        gates_passed = 0
-        if website_url != "ABSENT":
-            try:
-                domain_ok, _ = await check_dns(website_url)
-                if not domain_ok:
-                    print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
-                    continue
-                gates_passed = 1
-            except Exception as e:
-                print(f"[SMB_MAPS] DNS check error for {website_url}: {e} — continuing anyway")
-                gates_passed = 1
-
-        # Email scraper enrichment (scrapes website for real emails)
-        try:
-            enrichment = await enrich_lead_with_email(company_name, website_url)
-        except Exception as e:
-            print(f"[SMB_MAPS] Email scraper error for {company_name}: {e}")
-            enrichment = {
-                "verified_email": "ABSENT", "phone": "ABSENT",
-                "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
-            }
-
-        # Prefer scraped phone over maps phone if maps had none
-        phone = biz.get("phone", "ABSENT")
-        if phone == "ABSENT" or not phone:
-            phone = enrichment.get("phone", "ABSENT")
-
-        lead = {
-            "domain_hash": biz["domain_hash"],
+        if not company_name or company_name == "ABSENT":
+            continue
+        domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
+        if domain_hash in seen_hashes:
+            continue
+        seen_hashes.add(domain_hash)
+        # Normalize structured business to same format as maps_leads
+        all_candidates.append({
+            "domain_hash": domain_hash,
             "company_name": company_name,
             "website_url": website_url,
-            "dm_name": "ABSENT",
-            "dm_position": "ABSENT",
-            "verified_email": enrichment.get("verified_email", "ABSENT"),
-            "is_catchall": False,
-            "linkedin": enrichment.get("linkedin", "ABSENT"),
-            "instagram": enrichment.get("instagram", "ABSENT"),
-            "facebook": enrichment.get("facebook", "ABSENT"),
-            "phone": phone,
             "address": biz.get("address", "ABSENT"),
-            "rating": biz.get("rating", 0.0),
-            "review_count": biz.get("review_count", 0),
+            "phone": biz.get("phone", "ABSENT"),
+            "rating": _safe_float(biz.get("rating")),
+            "review_count": _safe_int(biz.get("review_count")),
             "category": biz.get("category", "ABSENT"),
-            "opening_hours": biz.get("opening_hours", "ABSENT"),
-            "validation_gates_passed": gates_passed,
-        }
+            "opening_hours": "ABSENT",
+        })
 
-        # Pre-filter: Footprint check
-        if not check_footprint(lead):
-            print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
-            continue
+    # Process leads concurrently with a semaphore to avoid overwhelming
+    # external APIs (email scraper, SMTP, DeepSeek, CheckNumber).
+    MAX_CONCURRENT_LEADS = 5
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_LEADS)
 
-        # Gate 2: SMTP (Starter/Growth/Pro)
-        # If SMTP fails on a GUESSED email (info@, contact@, etc.), we don't drop
-        # the lead — instead we clear the email and keep the lead (it still has
-        # phone, website, address). Only drop if SMTP fails on a SCRAPED (real) email.
-        email_source = enrichment.get("email_source", "none")
-        if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
-            try:
-                smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
-                lead["is_catchall"] = is_catchall
-                if not smtp_ok and not is_catchall:
-                    if email_source == "guessed":
-                        # Guessed email failed SMTP — keep the lead but clear the email.
-                        # The lead still has phone + website + address — still valuable.
-                        print(f"[SMB_MAPS] SMTP failed for guessed email {lead['verified_email']} — keeping lead, clearing email")
-                        lead["verified_email"] = "ABSENT"
-                        lead["is_catchall"] = False
-                    else:
-                        # Real scraped email failed SMTP — drop the lead.
-                        print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
-                        continue
-                else:
-                    gates_passed = 2
-                    lead["validation_gates_passed"] = gates_passed
-            except Exception as e:
-                print(f"[SMB_MAPS] SMTP error for {lead['verified_email']}: {e} — lenient accept")
-                gates_passed = 2
-                lead["validation_gates_passed"] = gates_passed
-
-        # Gate 3: DeepSeek AI (Pro only)
-        if user_tier == "pro" and lead["verified_email"] != "ABSENT":
-            try:
-                deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
-                if not deepseek_ok:
-                    print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
-                    continue
-                if is_role:
-                    lead["is_catchall"] = True
-                gates_passed = 3
-                lead["validation_gates_passed"] = gates_passed
-            except Exception as e:
-                print(f"[SMB_MAPS] DeepSeek Gate 3 error for {lead['verified_email']}: {e} — lenient accept")
-                gates_passed = 3
-                lead["validation_gates_passed"] = gates_passed
-
-        # Strip internal-only _source key before returning
-        lead.pop("_source", None)
-        leads.append(lead)
-
-    # --------------------------------------------------------
-    # PHASE 5: Validate & enrich DeepSeek-structured businesses
-    # --------------------------------------------------------
-    if structured_businesses and len(leads) < lead_target:
-        if progress_callback:
-            await progress_callback(70, f"Verifying more businesses...")
-
-        for biz in structured_businesses:
-            if len(leads) >= lead_target:
-                break
-
-            company_name = (biz.get("company_name") or "").strip()
+    async def process_single_lead(biz: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Process a single lead: DNS + email scrape + SMTP + DeepSeek. Returns lead dict or None."""
+        async with semaphore:
+            company_name = biz["company_name"]
             website_url = biz.get("website_url", "ABSENT")
-            if not company_name or company_name == "ABSENT":
-                continue
-
-            domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
-            if domain_hash in seen_hashes:
-                continue
-            seen_hashes.add(domain_hash)
-
-            # Gate 1: DNS Check
             gates_passed = 0
+
+            # Gate 1: DNS Check (ALL tiers — only if website exists)
             if website_url != "ABSENT":
                 try:
                     domain_ok, _ = await check_dns(website_url)
                     if not domain_ok:
                         print(f"[SMB_MAPS] DNS failed for {website_url} — DROPPED")
-                        continue
+                        return None
                     gates_passed = 1
                 except Exception as e:
                     print(f"[SMB_MAPS] DNS check error for {website_url}: {e} — continuing anyway")
@@ -562,18 +469,16 @@ async def run_smb_maps(
             except Exception as e:
                 print(f"[SMB_MAPS] Email scraper error for {company_name}: {e}")
                 enrichment = {
-                    "verified_email": "ABSENT", "phone": "ABSENT",
+                    "verified_email": "ABSENT", "email_source": "none", "phone": "ABSENT",
                     "facebook": "ABSENT", "instagram": "ABSENT", "linkedin": "ABSENT",
                 }
 
-            # Prefer scraped phone over DeepSeek phone
-            ds_phone = biz.get("phone", "ABSENT")
-            phone = enrichment.get("phone", "ABSENT")
+            phone = biz.get("phone", "ABSENT")
             if phone == "ABSENT" or not phone:
-                phone = ds_phone
+                phone = enrichment.get("phone", "ABSENT")
 
             lead = {
-                "domain_hash": domain_hash,
+                "domain_hash": biz["domain_hash"],
                 "company_name": company_name,
                 "website_url": website_url,
                 "dm_name": "ABSENT",
@@ -585,19 +490,18 @@ async def run_smb_maps(
                 "facebook": enrichment.get("facebook", "ABSENT"),
                 "phone": phone,
                 "address": biz.get("address", "ABSENT"),
-                "rating": _safe_float(biz.get("rating")),
-                "review_count": _safe_int(biz.get("review_count")),
+                "rating": biz.get("rating", 0.0),
+                "review_count": biz.get("review_count", 0),
                 "category": biz.get("category", "ABSENT"),
-                "opening_hours": "ABSENT",
+                "opening_hours": biz.get("opening_hours", "ABSENT"),
                 "validation_gates_passed": gates_passed,
             }
 
             if not check_footprint(lead):
                 print(f"[SMB_MAPS] Footprint failed for {company_name} — DROPPED")
-                continue
+                return None
 
             # Gate 2: SMTP (Starter/Growth/Pro)
-            # Same logic as above: don't drop leads when a guessed email fails SMTP.
             email_source = enrichment.get("email_source", "none")
             if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
                 try:
@@ -610,7 +514,7 @@ async def run_smb_maps(
                             lead["is_catchall"] = False
                         else:
                             print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
-                            continue
+                            return None
                     else:
                         gates_passed = 2
                         lead["validation_gates_passed"] = gates_passed
@@ -625,7 +529,7 @@ async def run_smb_maps(
                     deepseek_ok, is_role, _ = await check_deepseek(lead["verified_email"], company_name)
                     if not deepseek_ok:
                         print(f"[SMB_MAPS] DeepSeek Gate 3 rejected {lead['verified_email']} — DROPPED")
-                        continue
+                        return None
                     if is_role:
                         lead["is_catchall"] = True
                     gates_passed = 3
@@ -635,29 +539,37 @@ async def run_smb_maps(
                     gates_passed = 3
                     lead["validation_gates_passed"] = gates_passed
 
-            leads.append(lead)
+            # Phase 6: Messaging platform detection (WhatsApp + Telegram)
+            # Only for Growth and Pro tiers — run inline during concurrent processing
+            if user_tier in ("growth", "pro"):
+                p = lead.get("phone", "ABSENT")
+                if p and p != "ABSENT":
+                    try:
+                        messaging = await check_messaging_platforms(p)
+                        lead["is_whatsapp"] = messaging["whatsapp"]
+                        lead["is_telegram"] = messaging["telegram"]
+                        lead["messaging_checked"] = True
+                    except Exception as e:
+                        print(f"[SMB_MAPS] CheckNumber error for {p}: {e}")
+                        lead["is_whatsapp"] = False
+                        lead["is_telegram"] = False
+                        lead["messaging_checked"] = False
 
-    if progress_callback:
-        await progress_callback(88, f"Checking messaging platforms...")
+            lead.pop("_source", None)
+            return lead
 
-    # --------------------------------------------------------
-    # PHASE 6: Messaging platform detection (WhatsApp + Telegram)
-    # Only for Growth and Pro tiers
-    # --------------------------------------------------------
-    if user_tier in ("growth", "pro"):
-        for lead in leads:
-            phone = lead.get("phone", "ABSENT")
-            if phone and phone != "ABSENT":
-                try:
-                    messaging = await check_messaging_platforms(phone)
-                    lead["is_whatsapp"] = messaging["whatsapp"]
-                    lead["is_telegram"] = messaging["telegram"]
-                    lead["messaging_checked"] = True
-                except Exception as e:
-                    print(f"[SMB_MAPS] CheckNumber error for {phone}: {e}")
-                    lead["is_whatsapp"] = False
-                    lead["is_telegram"] = False
-                    lead["messaging_checked"] = False
+    # Run all lead processing concurrently
+    print(f"[SMB_MAPS] Processing {len(all_candidates)} leads concurrently (max {MAX_CONCURRENT_LEADS} at a time)")
+    tasks = [process_single_lead(biz) for biz in all_candidates[:lead_target * 2]]  # Process 2x target, we'll trim
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in results:
+        if len(leads) >= lead_target:
+            break
+        if isinstance(result, dict):
+            leads.append(result)
+        elif isinstance(result, Exception):
+            print(f"[SMB_MAPS] Lead processing error: {result}")
 
     if progress_callback:
         await progress_callback(95, f"Found {len(leads)} verified local businesses")

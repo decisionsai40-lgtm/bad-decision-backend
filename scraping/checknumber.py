@@ -104,7 +104,7 @@ async def check_messaging_platforms(phone_number: str) -> Dict[str, bool]:
     print(f"[CHECKNUMBER] Checking {cleaned} for WhatsApp + Telegram...")
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             # Check both platforms concurrently
             whatsapp_task = _check_single_platform(client, cleaned, "whatsapp")
             telegram_task = _check_single_platform(client, cleaned, "telegram")

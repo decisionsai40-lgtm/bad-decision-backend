@@ -50,11 +50,18 @@ async def _process_task_with_semaphore(semaphore: asyncio.Semaphore, task: Dict[
 
 
 # ============================================================
-# FETCH PENDING TASKS
+# FETCH PENDING TASKS + RECOVER STALE TASKS
 # ============================================================
 async def _fetch_pending_tasks():
     try:
         db = get_supabase()
+
+        # First, recover stale tasks — tasks stuck in "processing" for more
+        # than 5 minutes. This happens when the worker crashes or Render
+        # restarts the service mid-task. Without this, the task stays in
+        # "processing" forever and the frontend polls endlessly.
+        await _recover_stale_tasks(db)
+
         result = (
             db.table("tasks")
             .select("*, profiles(tier)")
@@ -67,6 +74,58 @@ async def _fetch_pending_tasks():
     except Exception as e:
         print(f"[WORKER] Error fetching tasks: {e}")
         return []
+
+
+async def _recover_stale_tasks(db):
+    """Fail tasks stuck in 'processing' for more than 5 minutes."""
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+
+        # Find stale processing tasks
+        stale_result = (
+            db.table("tasks")
+            .select("id, user_id, credits_reserved, query")
+            .eq("status", "processing")
+            .lt("updated_at", cutoff)
+            .limit(10)
+            .execute()
+        )
+
+        if not stale_result.data:
+            return
+
+        for task in stale_result.data:
+            task_id = task["id"]
+            user_id = task.get("user_id", "")
+            credits = task.get("credits_reserved", 0)
+            query = task.get("query", "")
+
+            print(f"[WORKER] Recovering stale task {task_id} (query='{query}') — was stuck in processing")
+
+            # Refund credits
+            if credits > 0 and user_id:
+                try:
+                    db.rpc("refund_credits", {
+                        "p_user_id": user_id,
+                        "p_amount": credits,
+                        "p_description": f"Refund: task {task_id} timed out (stale recovery)"
+                    }).execute()
+                except Exception as e:
+                    print(f"[WORKER] Error refunding stale task: {e}")
+
+            # Mark as failed
+            db.table("tasks").update({
+                "status": "failed",
+                "progress": 100,
+                "current_step": "Search timed out. The server restarted mid-search. Please try again.",
+                "error_message": "Task timed out (stale recovery — worker restarted)",
+                "credits_spent": 0,
+                "completed_at": datetime.utcnow().isoformat(),
+            }).eq("id", task_id).execute()
+
+    except Exception as e:
+        print(f"[WORKER] Error in stale task recovery: {e}")
 
 
 # ============================================================

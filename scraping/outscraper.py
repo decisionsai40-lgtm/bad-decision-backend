@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional
 
 OUTSCRAPER_API_KEY = os.getenv("OUTSCRAPER_API_KEY", "").strip()
 OUTSCRAPER_BASE_URL = "https://api.app.outscraper.com"
-SOURCE_TIMEOUT = 60  # Outscraper can take a while for large queries
+SOURCE_TIMEOUT = 30  # Reduced from 60 — was causing search timeouts
 
 
 async def scrape_google_maps(
