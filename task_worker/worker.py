@@ -179,7 +179,7 @@ async def _process_task(task: Dict[str, Any]):
 
         await _update_task(task_id, progress=10, current_step=f"Searching for up to {lead_target} leads...")
 
-        query_hash = compute_query_hash(query, task_type)
+        query_hash = compute_query_hash(query, task_type, country, state_region)
 
         # === CACHE CHECK ===
         # Before hitting the live web, check if we have fresh cached results

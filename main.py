@@ -912,6 +912,21 @@ async def generate_outreach(req: OutreachRequest, x_api_secret: Optional[str] = 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not generate messages: {str(e)}")
 
+    # 3b. Deduct credits for single outreach generation (3 credits per plan)
+    from credit_lots import deduct_credits_fifo
+    from config import CREDIT_COST_MSG_GEN_SINGLE
+    try:
+        deducted = await deduct_credits_fifo(
+            user_id, CREDIT_COST_MSG_GEN_SINGLE,
+            f"Outreach message generation (single) for lead {req.lead_id[:8]}"
+        )
+        if deducted:
+            print(f"[OUTREACH] Deducted {CREDIT_COST_MSG_GEN_SINGLE} credits for single message generation")
+        else:
+            print(f"[OUTREACH] WARNING: Could not deduct {CREDIT_COST_MSG_GEN_SINGLE} credits — insufficient balance?")
+    except Exception as credit_err:
+        print(f"[OUTREACH] Error deducting credits: {credit_err}")
+
     # 4. Save the messages to the database
     # Try with outreach_email_subject first; if the column doesn't exist yet
     # (migration not run), fall back to saving without it.
@@ -1085,6 +1100,24 @@ async def generate_outreach_batch(req: BatchOutreachRequest, x_api_secret: Optio
             print(f"[OUTREACH-BATCH] Error for lead {lead.get('id')}: {e}")
 
     action_word = "Regenerated" if req.force_regenerate else "Generated"
+
+    # 4. Deduct credits for batch outreach (2 credits per lead generated)
+    from credit_lots import deduct_credits_fifo
+    from config import CREDIT_COST_MSG_GEN_BATCH
+    credits_to_deduct = success_count * CREDIT_COST_MSG_GEN_BATCH
+    if credits_to_deduct > 0:
+        try:
+            deducted = await deduct_credits_fifo(
+                user_id, credits_to_deduct,
+                f"Outreach message generation (batch) for {success_count} leads"
+            )
+            if deducted:
+                print(f"[OUTREACH-BATCH] Deducted {credits_to_deduct} credits for {success_count} leads")
+            else:
+                print(f"[OUTREACH-BATCH] WARNING: Could not deduct {credits_to_deduct} credits — insufficient balance?")
+        except Exception as credit_err:
+            print(f"[OUTREACH-BATCH] Error deducting credits: {credit_err}")
+
     return {
         "success": True,
         "total_leads": len(leads),

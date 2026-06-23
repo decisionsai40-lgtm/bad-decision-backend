@@ -38,15 +38,14 @@ async def _check_single_platform(client: httpx.AsyncClient, phone: str, service:
             },
         )
 
-        if response.status_code == 429:
-            print(f"[CHECKNUMBER] Rate limited (429) for {phone} / {service}")
-            return False
-
+        # Log the raw response for debugging
         if response.status_code != 200:
-            print(f"[CHECKNUMBER] Error {response.status_code} for {phone}/{service}: {response.text[:200]}")
+            print(f"[CHECKNUMBER] {phone}/{service} → HTTP {response.status_code}: {response.text[:300]}")
             return False
 
         data = response.json()
+        # Log the raw response so we can see the actual format
+        print(f"[CHECKNUMBER] {phone}/{service} → RAW: {str(data)[:300]}")
 
         # The API may return the result under various field names.
         # Check all known variants:
@@ -61,10 +60,27 @@ async def _check_single_platform(client: httpx.AsyncClient, phone: str, service:
 
         # If status is "success" and no explicit boolean, check if status indicates registered
         status = (data.get("status") or "").lower() if isinstance(data, dict) else ""
-        if status == "registered" or status == "found":
+        if status == "registered" or status == "found" or status == "active":
             return True
 
-        print(f"[CHECKNUMBER] {phone}/{service} — couldn't parse response: {str(data)[:200]}")
+        # Check for "exists" field at top level
+        exists = data.get("exists")
+        if exists is not None:
+            return bool(exists)
+
+        # Check for "is_registered" at top level
+        is_reg = data.get("is_registered")
+        if is_reg is not None:
+            return bool(is_reg)
+
+        # If the response has a "data" key, check inside it
+        data_obj = data.get("data", {}) if isinstance(data, dict) else {}
+        if isinstance(data_obj, dict):
+            for key in ("is_registered", "registered", "exists", "found", "active", f"on_{service}"):
+                val = data_obj.get(key)
+                if val is not None:
+                    return bool(val)
+
         return False
 
     except Exception as e:

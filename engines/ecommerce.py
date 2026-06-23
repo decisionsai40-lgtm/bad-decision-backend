@@ -78,10 +78,12 @@ async def run_ecommerce(
         if isinstance(r, Exception) or not isinstance(r, list):
             continue
         for item in r:
-            url = item.get("link", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                all_urls.append(url)
+            raw_url = item.get("link", "")
+            # Clean the URL: extract root domain, skip aggregators/social
+            clean_url = extract_root_website(raw_url)
+            if clean_url and clean_url != "ABSENT" and clean_url not in seen_urls:
+                seen_urls.add(clean_url)
+                all_urls.append(clean_url)
 
     print(f"[ECOMMERCE] Discovered {len(all_urls)} unique URLs from {len(web_queries)} queries")
 

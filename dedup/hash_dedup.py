@@ -27,16 +27,22 @@ from supabase_client import get_supabase
 from config import CACHE_FRESHNESS_DAYS
 
 
-def compute_query_hash(query: str, task_type: str) -> str:
+def compute_query_hash(query: str, task_type: str, country: str = "", state_region: str = "") -> str:
     """
-    Create a SHA-256 hash from a normalized query + task_type.
+    Create a SHA-256 hash from a normalized query + task_type + location.
 
-    This gives every unique (query, engine) combination a unique hash.
-    The same query + engine always produces the same hash.
+    This gives every unique (query, engine, location) combination a unique hash.
+    The same query + engine + location always produces the same hash.
+
+    CRITICAL: Location MUST be part of the hash. Without it, "roofers" in Texas
+    and "roofers" in Arizona would share the same cache entry — returning Texas
+    results when the user searches Arizona.
     """
     # Normalize: lowercase, strip, collapse whitespace
-    normalized = " ".join(query.lower().strip().split())
-    combined = f"{normalized}|{task_type}"
+    normalized_query = " ".join(query.lower().strip().split())
+    normalized_country = (country or "").lower().strip()
+    normalized_state = (state_region or "").lower().strip()
+    combined = f"{normalized_query}|{task_type}|{normalized_country}|{normalized_state}"
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
