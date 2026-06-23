@@ -43,19 +43,38 @@ async def scrape_google_maps(
 
     try:
         async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT) as client:
-            # Start the scrape job
-            response = await client.post(
+            # Outscraper Google Maps search endpoint
+            # Docs: https://outscraper.com/docs/#google-maps
+            # Try the primary endpoint first, fall back to alternatives on 404
+            endpoints_to_try = [
+                f"{OUTSCRAPER_BASE_URL}/google-maps-search",
                 f"{OUTSCRAPER_BASE_URL}/google-maps",
-                headers={
-                    "X-API-KEY": OUTSCRAPER_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "query": search_query,
-                    "limit": min(limit, 500),
-                    "async": False,  # Synchronous mode (wait for results)
-                },
-            )
+            ]
+
+            response = None
+            for endpoint in endpoints_to_try:
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "X-API-KEY": OUTSCRAPER_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "query": search_query,
+                        "limit": min(limit, 500),
+                        "async": False,  # Synchronous mode (wait for results)
+                    },
+                )
+                if response.status_code == 200:
+                    break
+                if response.status_code == 404:
+                    print(f"[OUTSCRAPER] 404 on {endpoint}, trying next...")
+                    continue
+                # For other errors (403, 429, 500), don't retry
+                break
+
+            if response is None:
+                return []
 
             if response.status_code == 429:
                 print("[OUTSCRAPER] Rate limit hit (429)")
@@ -69,8 +88,19 @@ async def scrape_google_maps(
 
             data = response.json()
 
-            # Outscraper returns results in different formats depending on the endpoint
-            results = data if isinstance(data, list) else data.get("results", data.get("data", []))
+            # Outscraper returns results in different formats depending on the endpoint.
+            # The /google-maps-search endpoint returns: { "data": [...] } or just [...]
+            # Each item has fields like: name, site, phone, address, rating, reviews, category
+            if isinstance(data, dict):
+                results = data.get("data", data.get("results", []))
+            elif isinstance(data, list):
+                # Sometimes the response is a list with a single object containing the actual results
+                if len(data) == 1 and isinstance(data[0], dict) and "data" in data[0]:
+                    results = data[0]["data"]
+                else:
+                    results = data
+            else:
+                results = []
 
             businesses = []
             for item in results[:limit]:

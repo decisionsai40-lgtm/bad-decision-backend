@@ -80,16 +80,34 @@ def _is_spammy_email(email: str) -> bool:
     if len(email) > 100:
         return True
 
-    # Skip emails with suspicious domains
-    suspicious_domains = ['example.com', 'test.com', 'sentry.io', 'wixpress.com',
-                         'godaddy.com', 'cloudflare.com', 'google.com', 'facebook.com',
-                         'twitter.com', 'instagram.com', 'linkedin.com', 'youtube.com',
-                         'noreply.github.com', 'example.org']
+    # Skip emails with suspicious domains (placeholder/example domains)
+    suspicious_domains = [
+        'example.com', 'example.org', 'example.net', 'test.com', 'test.org',
+        'email.com', 'mail.com', 'domain.com', 'yourdomain.com', 'yoursite.com',
+        'sentry.io', 'wixpress.com', 'godaddy.com',
+        'cloudflare.com', 'google.com', 'facebook.com', 'twitter.com',
+        'instagram.com', 'linkedin.com', 'youtube.com', 'noreply.github.com',
+        'sentry-next.wixpress.com', 'static.wixstatic.com',
+    ]
     domain = email.split('@')[-1] if '@' in email else ''
     if domain in suspicious_domains:
         return True
 
-    # Skip emails that are just image filenames
+    # Skip emails with placeholder usernames
+    local_part = email.split('@')[0] if '@' in email else ''
+    placeholder_users = {
+        'example', 'test', 'demo', 'sample', 'user', 'your', 'youremail',
+        'email', 'yourname', 'firstname', 'lastname', 'name', 'foo', 'bar',
+        'lorem', 'ipsum', 'abc', 'xyz',
+    }
+    if local_part.lower() in placeholder_users:
+        return True
+
+    # Skip emails that match common placeholder patterns: example@email.com, test@test.com
+    if local_part.lower() == 'example' or 'example@' in email.lower():
+        return True
+
+    # Skip emails that are just image filenames (hex hashes)
     if re.match(r'^[a-f0-9]{32}@', email):
         return True
 
@@ -235,6 +253,7 @@ async def enrich_lead_with_email(
     """
     result = {
         "verified_email": "ABSENT",
+        "email_source": "none",  # "scraped" | "guessed" | "none"
         "phone": "ABSENT",
         "facebook": "ABSENT",
         "instagram": "ABSENT",
@@ -271,6 +290,9 @@ async def enrich_lead_with_email(
             if common_emails:
                 # Use the first common email (info@ is most likely)
                 result["verified_email"] = common_emails[0]
+                result["email_source"] = "guessed"  # Track that this was guessed, not scraped
                 print(f"[EMAIL_SCRAPER] No email found on website, using common pattern: {result['verified_email']}")
+    else:
+        result["email_source"] = "scraped"  # Real email found on the website
 
     return result

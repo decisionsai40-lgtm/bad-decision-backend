@@ -446,15 +446,28 @@ async def run_smb_maps(
             continue
 
         # Gate 2: SMTP (Starter/Growth/Pro)
+        # If SMTP fails on a GUESSED email (info@, contact@, etc.), we don't drop
+        # the lead — instead we clear the email and keep the lead (it still has
+        # phone, website, address). Only drop if SMTP fails on a SCRAPED (real) email.
+        email_source = enrichment.get("email_source", "none")
         if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
             try:
                 smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
                 lead["is_catchall"] = is_catchall
                 if not smtp_ok and not is_catchall:
-                    print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
-                    continue
-                gates_passed = 2
-                lead["validation_gates_passed"] = gates_passed
+                    if email_source == "guessed":
+                        # Guessed email failed SMTP — keep the lead but clear the email.
+                        # The lead still has phone + website + address — still valuable.
+                        print(f"[SMB_MAPS] SMTP failed for guessed email {lead['verified_email']} — keeping lead, clearing email")
+                        lead["verified_email"] = "ABSENT"
+                        lead["is_catchall"] = False
+                    else:
+                        # Real scraped email failed SMTP — drop the lead.
+                        print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
+                        continue
+                else:
+                    gates_passed = 2
+                    lead["validation_gates_passed"] = gates_passed
             except Exception as e:
                 print(f"[SMB_MAPS] SMTP error for {lead['verified_email']}: {e} — lenient accept")
                 gates_passed = 2
@@ -555,15 +568,23 @@ async def run_smb_maps(
                 continue
 
             # Gate 2: SMTP (Starter/Growth/Pro)
+            # Same logic as above: don't drop leads when a guessed email fails SMTP.
+            email_source = enrichment.get("email_source", "none")
             if user_tier in ("starter", "growth", "pro") and lead["verified_email"] != "ABSENT":
                 try:
                     smtp_ok, is_catchall = await check_smtp(lead["verified_email"])
                     lead["is_catchall"] = is_catchall
                     if not smtp_ok and not is_catchall:
-                        print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
-                        continue
-                    gates_passed = 2
-                    lead["validation_gates_passed"] = gates_passed
+                        if email_source == "guessed":
+                            print(f"[SMB_MAPS] SMTP failed for guessed email {lead['verified_email']} — keeping lead, clearing email")
+                            lead["verified_email"] = "ABSENT"
+                            lead["is_catchall"] = False
+                        else:
+                            print(f"[SMB_MAPS] SMTP failed for {lead['verified_email']} — DROPPED")
+                            continue
+                    else:
+                        gates_passed = 2
+                        lead["validation_gates_passed"] = gates_passed
                 except Exception as e:
                     print(f"[SMB_MAPS] SMTP error for {lead['verified_email']}: {e} — lenient accept")
                     gates_passed = 2

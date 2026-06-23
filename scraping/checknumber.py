@@ -28,6 +28,11 @@ async def check_messaging_platforms(phone_number: str) -> Dict[str, bool]:
         Returns all False if API key is not set or check fails.
     """
     if not CHECKNUMBER_API_KEY:
+        # Log this ONCE per process so we know why WhatsApp/Telegram icons never show.
+        # Without this log, it's invisible — the function just returns all False.
+        if not hasattr(check_messaging_platforms, '_warned_no_key'):
+            print("[CHECKNUMBER] WARNING: CHECKNUMBER_API_KEY is not set. WhatsApp/Telegram detection disabled.")
+            check_messaging_platforms._warned_no_key = True
         return {"whatsapp": False, "telegram": False}
 
     if not phone_number or phone_number == "ABSENT":
@@ -37,6 +42,8 @@ async def check_messaging_platforms(phone_number: str) -> Dict[str, bool]:
     cleaned = "".join(c for c in phone_number if c.isdigit() or c == "+")
     if not cleaned.startswith("+"):
         cleaned = "+" + cleaned
+
+    print(f"[CHECKNUMBER] Checking {cleaned} for WhatsApp + Telegram...")
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -61,10 +68,12 @@ async def check_messaging_platforms(phone_number: str) -> Dict[str, bool]:
                 return {"whatsapp": False, "telegram": False}
 
             data = response.json()
-            return {
+            result = {
                 "whatsapp": bool(data.get("whatsapp", False)),
                 "telegram": bool(data.get("telegram", False)),
             }
+            print(f"[CHECKNUMBER] {cleaned} → WhatsApp={result['whatsapp']}, Telegram={result['telegram']}")
+            return result
 
     except Exception as e:
         print(f"[CHECKNUMBER] Error checking {phone_number}: {e}")
