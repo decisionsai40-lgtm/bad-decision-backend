@@ -39,13 +39,16 @@ from scraping.serper_search import (
 from scraping.browserless import scrape_with_js
 from scraping.email_scraper import enrich_lead_with_email
 from scraping.osm_search import search_local_businesses
+from scraping.outscraper import scrape_google_maps, build_geo_split_queries
+from scraping.yelp_fusion import search_yelp
+from scraping.checknumber import check_messaging_platforms
 from ai.deepseek_middleware import execute_llm_payload, DEEPSEEK_SCOUT_MODEL
 from validation.gate_dns import check_dns
 from validation.gate_footprint import check_footprint
 from validation.gate_smtp import check_smtp
 from validation.gate_deepseek import check_deepseek
 from dedup.hash_dedup import compute_domain_hash
-from config import BROWSERLESS_API_KEY
+from config import BROWSERLESS_API_KEY, OUTSCRAPER_API_KEY, YELP_FUSION_API_KEY
 
 
 # ============================================================
@@ -175,6 +178,78 @@ async def run_smb_maps(
             for r in all_web_results
         )
         scraped_texts.append({"source": "Google Search (Serper.dev)", "content": serper_text})
+
+    # --------------------------------------------------------
+    # PHASE 1b: Outscraper Google Maps + Yelp (CONCURRENT, if configured)
+    # These sources dramatically increase lead count for paid tiers
+    # --------------------------------------------------------
+    if len(maps_leads) < lead_target:
+        if progress_callback:
+            await progress_callback(25, "Scanning maps and directories for more businesses...")
+
+        extra_tasks = []
+        extra_task_names = []
+
+        # Outscraper: geographic split queries for maximum coverage
+        if OUTSCRAPER_API_KEY:
+            geo_queries = build_geo_split_queries(query, location)
+            for gq in geo_queries[:3]:  # Cap at 3 sub-regions to control cost
+                extra_tasks.append(scrape_google_maps(query, gq, limit=min(100, lead_target)))
+                extra_task_names.append("outscraper")
+
+        # Yelp: free API, 240 results per search
+        if YELP_FUSION_API_KEY:
+            extra_tasks.append(search_yelp(query, location, limit=50))
+            extra_task_names.append("yelp")
+
+        if extra_tasks:
+            print(f"[SMB_MAPS] Running {len(extra_tasks)} extra source searches (Outscraper + Yelp)")
+            extra_results = await asyncio.gather(*extra_tasks, return_exceptions=True)
+
+            for i, result in enumerate(extra_results):
+                source_name = extra_task_names[i] if i < len(extra_task_names) else "unknown"
+                if isinstance(result, Exception):
+                    print(f"[SMB_MAPS] {source_name} error: {result}")
+                    continue
+                if not isinstance(result, list):
+                    continue
+
+                for biz in result:
+                    if len(maps_leads) >= lead_target:
+                        break
+
+                    company_name = (biz.get("company_name") or "").strip()
+                    if not company_name or company_name == "ABSENT":
+                        continue
+
+                    website_url = biz.get("website_url", "ABSENT")
+                    domain_hash = compute_domain_hash(website_url if website_url != "ABSENT" else company_name)
+                    if domain_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(domain_hash)
+
+                    lead = {
+                        "domain_hash": domain_hash,
+                        "company_name": company_name,
+                        "website_url": website_url,
+                        "address": biz.get("address", "ABSENT"),
+                        "phone": biz.get("phone", "ABSENT"),
+                        "rating": _safe_float(biz.get("rating")),
+                        "review_count": _safe_int(biz.get("review_count")),
+                        "category": biz.get("category", "ABSENT"),
+                        "opening_hours": biz.get("opening_hours", "ABSENT"),
+                        "_source": source_name,
+                    }
+
+                    # Add Yelp-specific fields if available
+                    if "yelp_url" in biz:
+                        lead["yelp_url"] = biz["yelp_url"]
+                    if "yelp_rating" in biz:
+                        lead["yelp_rating"] = biz["yelp_rating"]
+
+                    maps_leads.append(lead)
+
+                print(f"[SMB_MAPS] {source_name} added {len(result)} businesses (total now: {len(maps_leads)})")
 
     # --------------------------------------------------------
     # PHASE 2: If still short of target, fall back to OSM
@@ -513,7 +588,29 @@ async def run_smb_maps(
             leads.append(lead)
 
     if progress_callback:
-        await progress_callback(90, f"Found {len(leads)} verified local businesses")
+        await progress_callback(88, f"Checking messaging platforms...")
+
+    # --------------------------------------------------------
+    # PHASE 6: Messaging platform detection (WhatsApp + Telegram)
+    # Only for Growth and Pro tiers
+    # --------------------------------------------------------
+    if user_tier in ("growth", "pro"):
+        for lead in leads:
+            phone = lead.get("phone", "ABSENT")
+            if phone and phone != "ABSENT":
+                try:
+                    messaging = await check_messaging_platforms(phone)
+                    lead["is_whatsapp"] = messaging["whatsapp"]
+                    lead["is_telegram"] = messaging["telegram"]
+                    lead["messaging_checked"] = True
+                except Exception as e:
+                    print(f"[SMB_MAPS] CheckNumber error for {phone}: {e}")
+                    lead["is_whatsapp"] = False
+                    lead["is_telegram"] = False
+                    lead["messaging_checked"] = False
+
+    if progress_callback:
+        await progress_callback(95, f"Found {len(leads)} verified local businesses")
 
     print(f"[SMB_MAPS] Returning {len(leads)} verified leads")
     return leads
