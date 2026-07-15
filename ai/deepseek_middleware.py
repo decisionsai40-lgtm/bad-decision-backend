@@ -9,14 +9,16 @@ We support MULTIPLE API keys. When one key gets rate-limited (429),
 we automatically switch to the next key — like rotating fresh pitchers
 in a baseball game. If ALL keys are exhausted, we raise CriticalError.
 
-RETRY WITH BACKOFF:
-When all keys are rate-limited, we wait 5 seconds and try again (up to 2 times).
-This handles temporary rate-limit bursts during large searches.
+HARD TOTAL DEADLINE:
+The entire call (all keys, all retries) is capped at TOTAL_DEADLINE seconds.
+This prevents a single DeepSeek call from blocking the worker for 9+ minutes
+(which was the root cause of the "leads load forever then fail" bug).
 """
 
 import httpx
 import json
 import asyncio
+import time
 from typing import Dict, Any, List
 
 from config import DEEPSEEK_KEY_RING, DEEPSEEK_BASE_URL, DEEPSEEK_SCOUT_MODEL
@@ -27,10 +29,20 @@ class CriticalError(Exception):
     pass
 
 
+# Hard cap on the total time spent in execute_llm_payload, across all keys
+# and all retries. Previously this was unbounded (3 keys × 3 attempts × 60s
+# = up to 9 minutes), which caused task workers to hang indefinitely.
+TOTAL_DEADLINE = 30  # seconds — hard ceiling for any single LLM call
+PER_KEY_TIMEOUT = 12  # seconds — per-key request timeout (was 60)
+RETRY_DELAY = 2  # seconds — pause between full sweeps of the key ring
+
+
 async def execute_llm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Send a single request to DeepSeek, cycling through API keys on rate limits.
-    If all keys are exhausted, waits 5s and retries (up to 2 times).
+
+    Bounded by TOTAL_DEADLINE: no matter how many keys are exhausted or how
+    many timeouts occur, this function returns or raises within ~30 seconds.
 
     Args:
         payload: The request to send (includes model, messages, temperature, etc.)
@@ -39,18 +51,28 @@ async def execute_llm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         The AI's response as a dictionary
 
     Raises:
-        CriticalError: If ALL keys are exhausted after retries
+        CriticalError: If ALL keys are exhausted within the deadline
     """
     if not DEEPSEEK_KEY_RING:
-        raise CriticalError("No DeepSeek API keys configured! Set DEEPSEEK_API_KEY or DEEPSEEK_API_KEYS in .env")
+        raise CriticalError(
+            "No DeepSeek API keys configured! Set DEEPSEEK_API_KEY or DEEPSEEK_API_KEYS in .env"
+        )
 
-    max_retries = 2
-    retry_delay = 5  # seconds
+    deadline = time.monotonic() + TOTAL_DEADLINE
+    sweep = 0
 
-    for attempt in range(max_retries + 1):
-        async with httpx.AsyncClient(timeout=60) as client:
-            for key in DEEPSEEK_KEY_RING:
-                try:
+    while time.monotonic() < deadline:
+        sweep += 1
+        for key in DEEPSEEK_KEY_RING:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # Per-key timeout = min(PER_KEY_TIMEOUT, remaining deadline)
+            this_timeout = min(PER_KEY_TIMEOUT, remaining)
+
+            try:
+                async with httpx.AsyncClient(timeout=this_timeout) as client:
                     response = await client.post(
                         DEEPSEEK_BASE_URL,
                         headers={
@@ -60,32 +82,35 @@ async def execute_llm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                         json=payload,
                     )
 
-                    if response.status_code == 429:
-                        print(f"[DEEPSEEK] Key ...{key[-4:]} rate limited (429) — trying next key")
-                        continue
-
-                    if response.status_code == 200:
-                        return response.json()
-
-                    print(f"[DEEPSEEK] Key ...{key[-4:]} error {response.status_code}: {response.text[:200]}")
+                if response.status_code == 429:
+                    print(f"[DEEPSEEK] Key ...{key[-4:]} rate limited (429) — trying next key")
                     continue
 
-                except httpx.TimeoutException:
-                    print(f"[DEEPSEEK] Key ...{key[-4:]} timed out — trying next key")
-                    continue
+                if response.status_code == 200:
+                    return response.json()
 
-                except Exception as e:
-                    print(f"[DEEPSEEK] Key ...{key[-4:]} exception: {e}")
-                    continue
+                print(f"[DEEPSEEK] Key ...{key[-4:]} error {response.status_code}: {response.text[:200]}")
+                continue
 
-        # All keys failed on this attempt — wait and retry if we have attempts left
-        if attempt < max_retries:
-            print(f"[DEEPSEEK] All keys exhausted (attempt {attempt + 1}/{max_retries + 1}) — waiting {retry_delay}s before retry...")
-            await asyncio.sleep(retry_delay)
+            except httpx.TimeoutException:
+                print(f"[DEEPSEEK] Key ...{key[-4:]} timed out ({this_timeout:.0f}s) — trying next key")
+                continue
+            except Exception as e:
+                print(f"[DEEPSEEK] Key ...{key[-4:]} exception: {e}")
+                continue
+
+        # All keys failed on this sweep — pause and retry if we still have time
+        remaining = deadline - time.monotonic()
+        if remaining > RETRY_DELAY + 1:
+            print(f"[DEEPSEEK] All keys exhausted (sweep {sweep}) — waiting {RETRY_DELAY}s before retry ({remaining:.0f}s remaining)")
+            await asyncio.sleep(RETRY_DELAY)
         else:
-            raise CriticalError("GLOBAL_KEY_RING_EXHAUSTED — All DeepSeek API keys are rate-limited or failing after retries")
+            break
 
-    raise CriticalError("GLOBAL_KEY_RING_EXHAUSTED — All DeepSeek API keys are rate-limited or failing")
+    raise CriticalError(
+        f"GLOBAL_KEY_RING_EXHAUSTED — All DeepSeek API keys failed within {TOTAL_DEADLINE}s deadline "
+        f"(sweeps={sweep}, keys={len(DEEPSEEK_KEY_RING)})"
+    )
 
 
 async def execute_llm_batch(

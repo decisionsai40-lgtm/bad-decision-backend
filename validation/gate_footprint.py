@@ -3,7 +3,8 @@ BAD DECISION — Footprint Check (Pre-filter)
 ============================================
 This is a FAST pre-filter check. We verify that the lead has at least
 ONE way to contact them — a phone number, an email, a LinkedIn profile,
-an Instagram page, or at least a decision maker name.
+an Instagram page, a decision maker name, OR at least a live website
+(the user can always fill a contact form on the website).
 
 If a lead has ZERO contact methods, there's no point keeping it —
 nobody can reach them. We drop it before running the expensive
@@ -52,10 +53,25 @@ def check_footprint(lead: Dict[str, Any]) -> bool:
     if instagram != "ABSENT" and instagram and "instagram" in instagram.lower():
         contact_found = True
 
+    # Check for a real Facebook URL (not ABSENT)
+    facebook = lead.get("facebook", "ABSENT")
+    if facebook != "ABSENT" and facebook and "facebook" in facebook.lower():
+        contact_found = True
+
     # Check for a decision maker name (at least we know who to ask for)
     dm_name = lead.get("dm_name", "ABSENT")
     if dm_name != "ABSENT" and dm_name and len(dm_name) > 2:
         contact_found = True
+
+    # Last resort: a live website URL counts as a contact method —
+    # the user can fill a contact form on the site. Previously we DROPPED
+    # leads whose only contact info was a website, which was too aggressive
+    # and threw away real businesses (especially from Serper Maps results
+    # where phone numbers are often missing).
+    if not contact_found:
+        website = lead.get("website_url", "ABSENT")
+        if website and website != "ABSENT" and isinstance(website, str) and website.startswith("http"):
+            contact_found = True
 
     if not contact_found:
         print(f"[FOOTPRINT] {lead.get('company_name', 'Unknown')} — No contact method found, dropping")

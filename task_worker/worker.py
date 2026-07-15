@@ -7,14 +7,22 @@ import asyncio
 from datetime import datetime
 from typing import Dict, Any, Optional
 
-from supabase_client import get_supabase
+from supabase_client import get_supabase, reset_supabase_client
 from config import (
     TASK_POLL_INTERVAL, TASK_BATCH_SIZE, MAX_CONCURRENT_TASKS,
     LEAD_TARGET_FREE, LEAD_TARGET_STARTER, LEAD_TARGET_GROWTH, LEAD_TARGET_PAID,
     CREDIT_COST_SCAN, CREDIT_COST_DEEP, CREDIT_COST_SMTP,
+    TASK_TIMEOUT,
 )
 from engines import ENGINE_MAP
 from dedup.hash_dedup import save_query_cache, compute_query_hash, check_query_cache
+
+
+# Tracks currently-running asyncio tasks by task_id, so stale recovery can
+# CANCEL the zombie coroutine (not just mark the DB row as failed).
+# Without this, a runaway DeepSeek/email-scrape loop keeps burning CPU even
+# after the DB row says "failed".
+_running_tasks: Dict[str, asyncio.Task] = {}
 
 
 # ============================================================
@@ -26,6 +34,7 @@ async def run_task_worker():
     print("=" * 60)
     print("  BAD DECISION — Task Worker Started")
     print(f"  Polling every {TASK_POLL_INTERVAL}s | Max {MAX_CONCURRENT_TASKS} concurrent tasks")
+    print(f"  Per-task hard timeout: {TASK_TIMEOUT}s")
     print("=" * 60)
 
     while True:
@@ -46,7 +55,15 @@ async def run_task_worker():
 
 async def _process_task_with_semaphore(semaphore: asyncio.Semaphore, task: Dict[str, Any]):
     async with semaphore:
-        await _process_task(task)
+        this_task = asyncio.current_task()
+        task_id = task.get("id")
+        if task_id and this_task:
+            _running_tasks[task_id] = this_task
+        try:
+            await _process_task(task)
+        finally:
+            if task_id:
+                _running_tasks.pop(task_id, None)
 
 
 # ============================================================
@@ -73,24 +90,53 @@ async def _fetch_pending_tasks():
         return result.data or []
     except Exception as e:
         print(f"[WORKER] Error fetching tasks: {e}")
+        # If supabase client is in a bad state (e.g. "Server disconnected"),
+        # reset the singleton so the next poll gets a fresh connection.
+        if "disconnect" in str(e).lower() or "closed" in str(e).lower() or "connection" in str(e).lower():
+            print("[WORKER] Resetting Supabase client after connection error")
+            reset_supabase_client()
         return []
 
 
 async def _recover_stale_tasks(db):
-    """Fail tasks stuck in 'processing' for more than 5 minutes."""
+    """Fail tasks stuck in 'processing' for more than 5 minutes.
+
+    Two key fixes vs. the old version:
+    1. On supabase-py 'Server disconnected' / RemoteProtocolError, RESET the
+       singleton and retry once. The old code silently swallowed this error,
+       so stale tasks were never recovered.
+    2. CANCEL the zombie asyncio.Task if it's still running. The old code
+       just marked the DB row as 'failed' while the actual coroutine kept
+       running (burning DeepSeek quota, etc.).
+    """
     try:
         from datetime import datetime, timedelta
         cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
 
         # Find stale processing tasks
-        stale_result = (
-            db.table("tasks")
-            .select("id, user_id, credits_reserved, query")
-            .eq("status", "processing")
-            .lt("updated_at", cutoff)
-            .limit(10)
-            .execute()
-        )
+        try:
+            stale_result = (
+                db.table("tasks")
+                .select("id, user_id, credits_reserved, query")
+                .eq("status", "processing")
+                .lt("updated_at", cutoff)
+                .limit(10)
+                .execute()
+            )
+        except Exception as conn_err:
+            # Supabase-py's idle HTTP pool dies after ~5 min of inactivity
+            # with RemoteProtocolError("Server disconnected"). Reset and retry.
+            print(f"[WORKER] Stale recovery DB query failed ({conn_err}), resetting Supabase client and retrying once")
+            reset_supabase_client()
+            db = get_supabase()
+            stale_result = (
+                db.table("tasks")
+                .select("id, user_id, credits_reserved, query")
+                .eq("status", "processing")
+                .lt("updated_at", cutoff)
+                .limit(10)
+                .execute()
+            )
 
         if not stale_result.data:
             return
@@ -102,6 +148,20 @@ async def _recover_stale_tasks(db):
             query = task.get("query", "")
 
             print(f"[WORKER] Recovering stale task {task_id} (query='{query}') — was stuck in processing")
+
+            # Cancel the zombie coroutine if it's still running in this worker
+            zombie = _running_tasks.get(task_id)
+            if zombie and not zombie.done():
+                print(f"[WORKER] Cancelling zombie coroutine for task {task_id}")
+                zombie.cancel()
+                # Wait briefly for cancellation to propagate. Don't block the
+                # worker loop — if the zombie is stuck in a non-cancellable
+                # wait (rare), we let it die on its own.
+                try:
+                    await asyncio.wait_for(zombie, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+            _running_tasks.pop(task_id, None)
 
             # Refund credits
             if credits > 0 and user_id:
@@ -204,15 +264,32 @@ async def _process_task(task: Dict[str, Any]):
                 await _fail_task(task_id, user_id, credits_reserved, f"Unknown engine: {task_type}")
                 return
 
-            # Run the engine with lead_target
-            leads = await engine_func(
-                query=query,
-                user_tier=user_tier,
-                country=country,
-                state_region=state_region,
-                lead_target=lead_target,
-                progress_callback=_make_progress_callback(task_id),
-            )
+            # Run the engine with a HARD DEADLINE.
+            # Previously TASK_TIMEOUT was defined in config.py but NEVER used —
+            # a single runaway DeepSeek call could hang the worker for 9+ minutes
+            # (3 keys × 3 attempts × 60s per key). Now we cap the entire engine
+            # call at TASK_TIMEOUT seconds. If it exceeds, we cancel and fail
+            # the task with a clean refund.
+            progress_cb = _make_progress_callback(task_id)
+            try:
+                leads = await asyncio.wait_for(
+                    engine_func(
+                        query=query,
+                        user_tier=user_tier,
+                        country=country,
+                        state_region=state_region,
+                        lead_target=lead_target,
+                        progress_callback=progress_cb,
+                    ),
+                    timeout=TASK_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                print(f"[WORKER] Task {task_id} EXCEEDED {TASK_TIMEOUT}s hard deadline — cancelling and refunding")
+                await _fail_task(
+                    task_id, user_id, credits_reserved,
+                    f"Search timed out after {TASK_TIMEOUT}s. This can happen with very broad queries — try narrowing your search."
+                )
+                return
 
         # Save to cache for database building
         if leads:
@@ -258,6 +335,11 @@ async def _process_task(task: Dict[str, Any]):
         )
         print(f"[WORKER] Task {task_id} COMPLETED — {saved_count} leads, {credits_spent} credits spent")
 
+    except asyncio.CancelledError:
+        # Propagate cancellation (from stale recovery or shutdown) without
+        # marking as failed — stale recovery handles the DB state.
+        print(f"[WORKER] Task {task_id} was CANCELLED")
+        raise
     except asyncio.TimeoutError:
         print(f"[WORKER] Task {task_id} TIMED OUT")
         await _fail_task(task_id, user_id, credits_reserved, "Search timed out. Please try again.")
@@ -285,10 +367,17 @@ async def _fail_task(task_id: str, user_id: str, credits_reserved: int, error_me
 
 
 async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
-    """Save leads to workspace_leads with all engine-specific fields."""
+    """Save leads to workspace_leads with all engine-specific fields.
+
+    BATCH INSERT — the old version inserted one row at a time, which meant
+    50 leads = 50 round-trips to Postgres. Now we send them in one batch.
+    """
+    if not leads:
+        return 0
+
     db = get_supabase()
-    saved = 0
     seen_hashes = set()
+    rows = []
 
     for lead in leads:
         domain_hash = lead.get("domain_hash")
@@ -297,7 +386,6 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
         if domain_hash:
             seen_hashes.add(domain_hash)
 
-        # All possible fields (engine-specific ones are optional)
         row = {
             "task_id": task_id,
             "user_id": user_id,
@@ -319,7 +407,6 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
             "platform": lead.get("platform"),
             "intent_text": lead.get("intent_text"),
             "validation_gates_passed": lead.get("validation_gates_passed", 0),
-            # New engine-specific fields (may be NULL if not applicable)
             "rating": lead.get("rating"),
             "review_count": lead.get("review_count"),
             "category": lead.get("category"),
@@ -328,11 +415,9 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
             "intent_level": lead.get("intent_level"),
             "post_url": lead.get("post_url"),
             "author_username": lead.get("author_username"),
-            # Outreach messages
             "outreach_email": lead.get("outreach_email"),
             "outreach_social": lead.get("outreach_social"),
             "outreach_call": lead.get("outreach_call"),
-            # Ecommerce fields
             "ecommerce_platform": lead.get("ecommerce_platform"),
             "product_count": lead.get("product_count"),
             "product_categories": lead.get("product_categories"),
@@ -346,17 +431,14 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
             "uses_subscriptions": lead.get("uses_subscriptions"),
             "store_age_days": lead.get("store_age_days"),
             "social_media_links": lead.get("social_media_links"),
-            # Ads engine fields
             "ad_platforms": lead.get("ad_platforms"),
             "ad_start_date": lead.get("ad_start_date"),
             "ad_creative_url": lead.get("ad_creative_url"),
             "estimated_monthly_ad_spend": lead.get("estimated_monthly_ad_spend"),
-            # Companies enrichment fields
             "naics_code": lead.get("naics_code"),
             "naics_description": lead.get("naics_description"),
             "business_start_date": lead.get("business_start_date"),
             "company_officers": lead.get("company_officers"),
-            # Messaging platform detection
             "is_whatsapp": lead.get("is_whatsapp"),
             "is_telegram": lead.get("is_telegram"),
             "messaging_checked": lead.get("messaging_checked"),
@@ -364,14 +446,28 @@ async def _save_leads(task_id: str, user_id: str, leads: list) -> int:
 
         # Remove None values
         row = {k: v for k, v in row.items() if v is not None}
+        rows.append(row)
 
-        try:
-            db.table("workspace_leads").insert(row).execute()
-            saved += 1
-        except Exception as e:
-            print(f"[WORKER] Error saving lead: {e}")
+    if not rows:
+        return 0
 
-    return saved
+    # Try a single batch insert. If it fails (e.g. one row violates a constraint),
+    # fall back to per-row inserts so one bad lead doesn't kill the whole batch.
+    try:
+        result = db.table("workspace_leads").insert(rows).execute()
+        saved = len(result.data) if result.data else 0
+        print(f"[WORKER] Batch-inserted {saved} leads in one call")
+        return saved
+    except Exception as batch_err:
+        print(f"[WORKER] Batch insert failed ({batch_err}), falling back to per-row insert")
+        saved = 0
+        for row in rows:
+            try:
+                db.table("workspace_leads").insert(row).execute()
+                saved += 1
+            except Exception as e:
+                print(f"[WORKER] Error saving lead: {e}")
+        return saved
 
 
 async def _create_smart_collection(user_id: str, task_id: str, name: str, task_type: str, lead_count: int):
@@ -393,6 +489,9 @@ async def _update_task(task_id: str, **fields):
         db.table("tasks").update(fields).eq("id", task_id).execute()
     except Exception as e:
         print(f"[WORKER] Error updating task {task_id}: {e}")
+        # If the connection died, reset so the next call gets a fresh client
+        if "disconnect" in str(e).lower() or "closed" in str(e).lower() or "connection" in str(e).lower():
+            reset_supabase_client()
 
 
 async def _update_task_status(task_id: str, status: str):

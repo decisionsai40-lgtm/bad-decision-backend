@@ -10,6 +10,7 @@ This is completely FREE — no API keys needed.
 """
 
 import re
+import asyncio
 import httpx
 from typing import Optional, List, Dict
 from urllib.parse import urlparse, urljoin
@@ -205,7 +206,10 @@ async def scrape_website_for_emails(website_url: str) -> Dict[str, any]:
                     if li_match:
                         result["linkedin"] = li_match.group(0).rstrip('/')
 
-                # Also try common contact page
+                # Also try common contact pages — fetch ALL of them concurrently
+                # (was sequential, which meant worst case = 4 × 8s = 32s per lead).
+                # We gather all responses, then prefer the first non-empty result
+                # in priority order (contact > contact-us > about > about-us).
                 if not result["emails"]:
                     contact_urls = [
                         f"https://{domain}/contact",
@@ -213,19 +217,26 @@ async def scrape_website_for_emails(website_url: str) -> Dict[str, any]:
                         f"https://{domain}/about",
                         f"https://{domain}/about-us",
                     ]
-                    for contact_url in contact_urls:
+                    contact_ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+                    async def _fetch_contact(cu: str) -> str:
                         try:
-                            contact_res = await client.get(
-                                contact_url,
-                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                            )
-                            if contact_res.status_code == 200:
-                                contact_emails = find_emails_in_html(contact_res.text)
-                                if contact_emails:
-                                    result["emails"].extend(contact_emails[:5])
-                                    break
-                        except:
-                            pass
+                            r = await client.get(cu, headers=contact_ua)
+                            return r.text if r.status_code == 200 else ""
+                        except Exception:
+                            return ""
+
+                    # Concurrent fetch — 4 requests in parallel, bounded by httpx's
+                    # internal connection limit. Total time = max(individual latencies)
+                    # instead of sum(individual latencies).
+                    pages = await asyncio.gather(*[_fetch_contact(cu) for cu in contact_urls])
+                    for html_text in pages:
+                        if not html_text:
+                            continue
+                        contact_emails = find_emails_in_html(html_text)
+                        if contact_emails:
+                            result["emails"].extend(contact_emails[:5])
+                            break  # stop after first page that yields emails
 
                 print(f"[EMAIL_SCRAPER] Found {len(result['emails'])} emails for {domain}")
 

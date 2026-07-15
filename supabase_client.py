@@ -7,6 +7,16 @@ user's data. RLS policies protect the anon key (used by the browser).
 
 Lazy singleton: client created on first call.
 Does NOT crash at import time if env vars are missing.
+
+Connection resilience:
+    supabase-py v2 holds a single httpx client with a connection pool.
+    After ~5 min of idle time, the PostgREST server closes the TCP
+    connection, and the next query fails with
+    `httpx.RemoteProtocolError: Server disconnected` (this was the
+    "[WORKER] Error in stale task recovery: Server disconnected" log line).
+
+    To recover, call `reset_supabase_client()` — the next `get_supabase()`
+    call will create a fresh client with a fresh connection pool.
 """
 
 from supabase import create_client, Client
@@ -38,3 +48,16 @@ def get_supabase() -> Client:
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     return _supabase_client
+
+
+def reset_supabase_client() -> None:
+    """
+    Discard the cached Supabase client so the next `get_supabase()` call
+    creates a fresh one with a new HTTP connection pool.
+
+    Call this after a `httpx.RemoteProtocolError: Server disconnected` /
+    `httpx.ConnectError` / `httpx.PoolTimeout` to recover without restarting
+    the worker process.
+    """
+    global _supabase_client
+    _supabase_client = None

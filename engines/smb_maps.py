@@ -442,7 +442,11 @@ async def run_smb_maps(
 
     # Process leads concurrently with a semaphore to avoid overwhelming
     # external APIs (email scraper, SMTP, DeepSeek, CheckNumber).
-    MAX_CONCURRENT_LEADS = 5
+    # Use config.MAX_CONCURRENT_LEADS (default 10) instead of the old
+    # hardcoded 5 — the email scraper is lightweight and the previous
+    # setting was bottlenecking throughput.
+    from config import MAX_CONCURRENT_LEADS as _CFG_MAX_LEADS
+    MAX_CONCURRENT_LEADS = max(5, _CFG_MAX_LEADS)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LEADS)
 
     async def process_single_lead(biz: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -566,10 +570,37 @@ async def run_smb_maps(
             lead.pop("_source", None)
             return lead
 
-    # Run all lead processing concurrently
+    # Run all lead processing concurrently.
+    # A heartbeat coroutine bumps the task's `current_step` every 15s so the
+    # DB row's `updated_at` stays fresh and the worker's stale-recovery
+    # (5-min threshold) doesn't false-positive kill a long-but-healthy task.
     print(f"[SMB_MAPS] Processing {len(all_candidates)} leads concurrently (max {MAX_CONCURRENT_LEADS} at a time)")
     tasks = [process_single_lead(biz) for biz in all_candidates[:lead_target * 2]]  # Process 2x target, we'll trim
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _heartbeat():
+        """Bump current_step every 15s so updated_at doesn't go stale."""
+        tick = 0
+        while True:
+            await asyncio.sleep(15)
+            tick += 1
+            if progress_callback:
+                try:
+                    await progress_callback(
+                        55,
+                        f"Verifying businesses ({tick * 15}s elapsed)…",
+                    )
+                except Exception:
+                    pass
+
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     for result in results:
         if len(leads) >= lead_target:

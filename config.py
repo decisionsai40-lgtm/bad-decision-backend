@@ -162,8 +162,10 @@ MAX_CONCURRENT_LEADS = 10     # Increased — email scraper is lightweight
 # ============================================================
 SOURCE_TIMEOUT = 8  # Reduced from 15 — was causing slow searches with many website timeouts
 SCRAPINGANT_TIMEOUT = 30      # ScrapingAnt needs more time (JS rendering)
-TASK_TIMEOUT = 180            # 3 minutes for larger searches
-SMTP_TIMEOUT = 10
+TASK_TIMEOUT = 240            # 4 minutes — caps any single engine run. Was defined but
+                              # NEVER USED before; now enforced via asyncio.wait_for in worker.py
+SMTP_TIMEOUT = 5              # Reduced from 10 — Render blocks outbound port 25 anyway,
+                              # so most SMTP connects fail fast. Don't waste 10s/lead.
 DEEPSEEK_TIMEOUT = 60
 
 # ============================================================

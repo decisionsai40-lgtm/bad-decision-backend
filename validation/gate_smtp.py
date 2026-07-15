@@ -27,6 +27,8 @@ import random
 import string
 from typing import Tuple
 
+from config import SMTP_TIMEOUT
+
 
 async def check_smtp(email_address: str) -> Tuple[bool, bool]:
     """
@@ -62,7 +64,10 @@ async def check_smtp(email_address: str) -> Tuple[bool, bool]:
         return False, False
 
     try:
-        server = smtplib.SMTP(timeout=10)
+        # Use the SMTP_TIMEOUT from config (default 5s — was hardcoded 10s).
+        # Render blocks outbound port 25 so most connects fail fast anyway;
+        # don't waste 10s per lead on hosts that silently drop the SYN.
+        server = smtplib.SMTP(timeout=SMTP_TIMEOUT)
         server.connect(mx_record, 25)
         server.ehlo("verify.baddecision.app")
         server.mail("verify@baddecision.app")

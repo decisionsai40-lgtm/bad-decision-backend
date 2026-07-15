@@ -4,6 +4,12 @@ BAD DECISION — Browser Based Page Reader
 Replaces ScrapingAnt. Uses Browserless.io for JS-rendered page scraping.
 Free tier: 2 concurrent browsers. Scale tier: $350/mo for 100K+ renders.
 Includes 7-day cache layer (when Redis is available in Phase D).
+
+Browserless v2 API:
+    The /content endpoint only accepts POST with a JSON body. The old
+    GET-style `?token=...&url=...` was removed in v2 — calling it returns
+    `404 No route or file found for resource GET: /content`, which is
+    exactly what we were seeing in the Render logs.
 """
 import httpx
 import os
@@ -31,18 +37,19 @@ async def scrape_with_js(url: str, wait_for: str = "") -> Optional[str]:
         print(f"[BROWSERLESS] Blocked internal URL: {url}")
         return None
 
-    params = {
-        "token": BROWSERLESS_API_KEY,
-        "url": url,
-    }
+    # Browserless v2: POST /content with JSON body.
+    # The token stays in the query string (Browserless extracts it before
+    # routing the body), and url/waitFor go in the JSON payload.
+    body: dict = {"url": url}
     if wait_for:
-        params["waitFor"] = wait_for
+        body["waitFor"] = wait_for
 
     try:
         async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT) as client:
-            response = await client.get(
+            response = await client.post(
                 f"{BROWSERLESS_BASE_URL}/content",
-                params=params,
+                params={"token": BROWSERLESS_API_KEY},
+                json=body,
             )
 
             if response.status_code == 429:
